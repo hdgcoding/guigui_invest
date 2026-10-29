@@ -1,8 +1,7 @@
-# output/ 仅提交最终分析报告；中间产物（数据包/PDF提取/估值计算/缓存）可再生，不入库
+# output/ 仅提交最终分析报告(.md)；中间产物与 HTML(可由 report_tohtml 再生)不入库
 output/**
 !output/**/
 !output/**/*报告*.md
-!output/**/*报告*.html
 !output/**/qualitative_report.md
 
 *.pyc
