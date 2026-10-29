@@ -166,7 +166,12 @@ def _yi_cells(values):
 
 def build_report(sections: Dict[str, str], pe_bands: List[float],
                  discounts: List[float]) -> str:
-    parts: List[str] = ["# 计算结果 — computed_metrics.md（Python 确定性预算）\n", HEADER_WARNING]
+    from datetime import datetime as _dt
+    stamp = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+    parts: List[str] = [
+        f"# 计算结果 — computed_metrics.md（Python 确定性预算）\n\n*计算时间: {stamp}*\n",
+        HEADER_WARNING,
+    ]
 
     inc_cols, inc = parse_matrix(sections["3"]) if "3" in sections else ([], {})
     bs_cols, bs = parse_matrix(sections["4"]) if "4" in sections else ([], {})

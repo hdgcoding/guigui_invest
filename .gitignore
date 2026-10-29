@@ -1,5 +1,8 @@
-# 输出目录与缓存
-output/
+# 输出目录纳入版本控制（数据包/报告/估值结果），仅排除缓存与二进制大文件
+output/.collector_cache/
+output/.screener_cache/
+output/**/*.pdf
+
 *.pyc
 __pycache__/
 .venv/
