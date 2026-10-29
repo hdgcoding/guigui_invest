@@ -107,6 +107,8 @@ output/{code}_{company}/  报告 .md + .html
 7. **写作风格**：结论先行、lead-with-numbers、禁止模糊量化词（详见 shared/qualitative/references/writing_style_rules.md）。
 8. **选股器口径**：Tier 1 的 PE 为静态口径（最新年报 EPS）；新浪财务指标限流时自动从三大报表推导 ROE/毛利率/负债率。
 9. **PDF-first**：定性分析优先用 `pdf_preprocessor --text-output --full-text` 产出的文本（摘要 → 按需读全文分片），扫描件降级 WebSearch。
+10. **产出入库范围**：`output/` 仅最终报告（`*报告*.md/html`、`qualitative_report.md`）提交 Git；中间产物（数据包/PDF提取/估值计算/缓存）可再生，不入库。
+11. **报告更新协议**：用户说"更新 XX 的报告"时——① 读旧报告（分析日期/结论/关键指标）作为基线；② 重新采集数据（数据包 >7 天则全量，否则 `--refresh-market`）；③ 重跑估值引擎与 §17；④ 新报告**必须增加「较上期变化」对照节**（价格 / 穿透回报率 R / 底价溢价 / 评级变动及归因），正文其余结构保持不变；⑤ Git 历史天然提供报告版本追溯。
 
 ## 开发规范
 
