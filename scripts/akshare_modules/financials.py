@@ -469,24 +469,20 @@ class FinancialsMixin:
     # §6 — Dividends
     # ------------------------------------------------------------------
 
-    def get_dividends(self, ts_code: str) -> str:
-        """Section 6: dividend history from em 分红送配详情."""
-        num, _ = split_code(ts_code)
+    def _fetch_dividends_df(self, num: str) -> pd.DataFrame:
+        """Normalized em dividend plans (implemented + pending, desc).
 
+        Columns: end_date/cash_div_tax(每股,元)/stk_div/base_share(万股)/
+                 div_proc/ex_date/plan
+        """
         def _fetch():
             import akshare as ak
             return ak.stock_fhps_detail_em(symbol=num)
 
         df = self._fetch_with_retry(_fetch)
-        if df is None:
-            df = pd.DataFrame()
-        lines = [format_header(2, "6. 分红历史"), ""]
+        if df is None or df.empty:
+            return pd.DataFrame()
 
-        if df.empty:
-            lines.append("暂无分红数据\n")
-            return "\n".join(lines)
-
-        # Normalize to internal contract
         recs = []
         for _, r in df.iterrows():
             report_period = str(r.get("报告期", ""))
@@ -507,9 +503,18 @@ class FinancialsMixin:
                 "ex_date": str(r.get("除权除息日", "")),
                 "plan": str(r.get("现金分红-现金分红比例描述", "")),
             })
+        if not recs:
+            return pd.DataFrame()
+        return pd.DataFrame(recs).sort_values("end_date", ascending=False).reset_index(drop=True)
 
-        all_div = pd.DataFrame(recs)
-        if all_div.empty:
+    def get_dividends(self, ts_code: str) -> str:
+        """Section 6: dividend history from em 分红送配详情."""
+        num, _ = split_code(ts_code)
+        all_div = self._fetch_dividends_df(num)
+
+        lines = [format_header(2, "6. 分红历史"), ""]
+
+        if all_div is None or all_div.empty:
             lines.append("暂无分红数据\n")
             return "\n".join(lines)
 
@@ -631,30 +636,33 @@ class FinancialsMixin:
     # §12 — Financial indicators
     # ------------------------------------------------------------------
 
-    def get_fina_indicators(self, ts_code: str) -> str:
-        """Section 12: key financial indicators (新浪财务指标)."""
-        num, _ = split_code(ts_code)
-
+    def _fetch_fina_indicators_df(self, num: str) -> pd.DataFrame:
+        """Normalized sina fina indicators (end_date + internal cols, desc)."""
         def _fetch():
             import akshare as ak
             return ak.stock_financial_analysis_indicator(symbol=num)
 
         df = self._fetch_with_retry(_fetch)
-        if df is None:
-            df = pd.DataFrame()
-        lines = [format_header(2, "12. 关键财务指标"), ""]
+        if df is None or df.empty or "日期" not in df.columns:
+            return pd.DataFrame()
 
-        if df.empty:
-            lines.append("数据缺失\n")
-            return "\n".join(lines)
-
-        # Normalize: 报告日(1996-12-31 格式) -> end_date YYYYMMDD
         out = pd.DataFrame()
         out["end_date"] = pd.to_datetime(df["日期"]).dt.strftime("%Y%m%d")
         for internal, cn in SINA_FINA_INDICATOR_MAP.items():
-            out[internal] = pd.to_numeric(df[cn], errors="coerce") if cn in df.columns else pd.NA
+            out[internal] = (pd.to_numeric(df[cn], errors="coerce")
+                             if cn in df.columns else pd.NA)
         out = out.drop_duplicates(subset=["end_date"])
-        out = out.sort_values("end_date", ascending=False).reset_index(drop=True)
+        return out.sort_values("end_date", ascending=False).reset_index(drop=True)
+
+    def get_fina_indicators(self, ts_code: str) -> str:
+        """Section 12: key financial indicators (新浪财务指标)."""
+        num, _ = split_code(ts_code)
+        out = self._fetch_fina_indicators_df(num)
+        lines = [format_header(2, "12. 关键财务指标"), ""]
+
+        if out.empty:
+            lines.append("数据缺失\n")
+            return "\n".join(lines)
 
         disp, years = self._prepare_display_periods(out)
         self._store["fina_indicators"] = disp

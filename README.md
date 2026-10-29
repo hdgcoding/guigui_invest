@@ -63,6 +63,45 @@ output/{code}_{company}/  报告 .md + .html
 - 新浪现金流无折旧摊销附表 → §17.12 G 网格降级，LLM 改用行业 G 锚点（shared_tables.md）
 - 个别接口被代理拦截 → 自动绕过代理重试，仍失败则标注"数据缺失"
 
+## 选股器（两级筛选）
+
+**Tier 1 — 批量过滤**（全市场快照，5 次批量接口，~1 分钟）：
+
+| 数据 | 来源 |
+|---|---|
+| 价格/名称/成交额 | `stock_zh_a_spot`（新浪全市场） |
+| EPS/BPS/ROE/毛利率/行业 | `stock_yjbb_em`（东财业绩报表，最新年报期） |
+| TTM 每股股息 + 总股本 | `stock_fhps_em`（东财分红送配，近 5 个报告期聚合） |
+| 上市日期 | `stock_info_sh/sz_name_code`（交易所） |
+
+过滤：排除 ST/PT/退市/银行（可配）→ 上市 ≥3 年 → 市值 ≥5 亿 → 日成交额 ≥0.1 亿（换手率代理）→ 0<PB≤10 → 双通道 PE（主通道 0<PE≤50 + 股息率>0；观察通道亏损股按市值前 50）→ 排名 `0.4×dv + 0.3×(1/PE) + 0.3×(1/PB)`（归一化）取前 150。
+
+**Tier 2 — 深度分析**（逐只，复用 AKShareClient 采集器 + TTL 缓存）：
+- 硬否决：质押比 >70%（审计意见 AKShare 不可得，跳过）
+- 财务质量：ROE ≥8%、毛利率 ≥15%、资产负债率 ≤70%（新浪指标限流时自动从三大报表推导）
+- 因子 2：M（3 年支付率）/ AA / 穿透率 R / 门槛 II（max(3.5%, Rf+2%)）
+- 因子 4：EV/EBITDA / FCF 收益率 / 现金调整 PE / 商誉占比
+- 底价 5 法均值：净流动资产/BVPS/10 年低点/股息隐含/悲观 FCF
+- 综合评分：ROE 20% + FCF 收益率 20% + 穿透率 R 25% + EV/EBITDA(逆) 15% + 底价溢价(逆) 20%
+
+> 注：Tier 1 的 PE 为静态口径（最新年报 EPS），与原版 PE_TTM 略有差异（文档化近似）。
+
+## PDF-first 深度分析（GLM 文本优先）
+
+```bash
+# 1. 下载年报（或由 /download-annual-report 命令完成）
+# 2. 提取文本：章节摘要 + 全文分片
+.venv/bin/python scripts/pdf_preprocessor.py --pdf <年报.pdf> \
+  --output output/{code}_{company}/pdf_sections.json \
+  --text-output output/{code}_{company}/pdf_sections_text.md --full-text
+```
+
+产出（伊利 2025 年报 259 页实测，7/7 章节命中）：
+- `pdf_sections_text.md` — 7 章节摘要（P2 治理/P3 会计政策/P4 应收/P6 合并报表/P13 风险/MDA/SUB）
+- `pdf_sections_text_fulltext_part1..N.md` — 全文分片（~120K 字符/片），Agent 按需读取
+
+`/business-analysis` 命令已内置该流程：先读章节摘要 → 需要时按优先级读全文分片 → 提取附注生成 `data_pack_report.md`。
+
 ## 脚本 CLI
 
 ```bash
@@ -78,6 +117,19 @@ output/{code}_{company}/  报告 .md + .html
 
 # 估值引擎（分类 + WACC + DCF/DDM/PE Band + 敏感性表）
 .venv/bin/python scripts/valuation_engine.py --code 600887 --output-dir output/600887_伊利股份/
+
+# 选股器（两级筛选）
+.venv/bin/python scripts/screener_core.py --tier1-only              # Tier 1 快速筛选（~1分钟）
+.venv/bin/python scripts/screener_core.py --tier2-limit 30          # 完整流程（限制 Tier 2 数量）
+.venv/bin/python scripts/screener_core.py --min-roe 10 --max-pe 30  # 自定义阈值
+.venv/bin/python scripts/screener_core.py --csv output/s.csv --html output/s.html  # 导出
+.venv/bin/python scripts/screener_core.py --cache-refresh           # 刷新缓存
+
+# 年报 PDF 文本提取（PDF-first 深度分析, GLM 文本优先）
+.venv/bin/python scripts/pdf_preprocessor.py \
+  --pdf output/{code}_{company}/*年报*.pdf \
+  --output output/{code}_{company}/pdf_sections.json \
+  --text-output output/{code}_{company}/pdf_sections_text.md --full-text
 
 # 质量杠杆脚本
 .venv/bin/python scripts/quality_control.py --input <data_pack> --output <computed_metrics>
@@ -103,9 +155,11 @@ guigui_invest/
 │   ├── akshare_collector.py     # 数据采集门面（AKShareClient + CLI）
 │   ├── akshare_modules/         # 采集模块（financials/other_data/assembly/derived_metrics）
 │   ├── valuation_engine.py      # 估值引擎
+│   ├── screener_core.py         # 选股器（两级筛选 Tier 1 + Tier 2）
+│   ├── screener_config.py       # 选股器阈值/权重配置
 │   ├── quality_control.py       # 杠杆1: 确定性预计算 CM§1-5
 │   ├── report_consistency.py    # 杠杆6: 跨段数值冲突扫描
-│   ├── pdf_preprocessor.py      # 年报 PDF 章节提取
+│   ├── pdf_preprocessor.py      # 年报 PDF 章节提取 + 文本导出（--text-output/--full-text）
 │   ├── download_report.py       # 年报 PDF 下载
 │   └── report_to_html.py        # MD → HTML 仪表盘
 ├── tests/                       # 51 个测试（Mock 数据，无需网络）
@@ -124,10 +178,10 @@ guigui_invest/
 ## 测试
 
 ```bash
-AKSHARE_RATE_DELAY=0 .venv/bin/python -m pytest tests/ -v   # 51 tests, no network
+AKSHARE_RATE_DELAY=0 .venv/bin/python -m pytest tests/ -v   # 70 tests, no network
 ```
 
-覆盖：代码验证 / store 契约 / 中期+末期分红合并支付率 / §17 衍生指标全链路 / 新浪报表归一化 / 周线重采样 / 数据包分段解析 / 风险检测。
+覆盖：代码验证 / store 契约 / 中期+末期分红合并支付率 / §17 衍生指标全链路 / 新浪报表归一化 / 周线重采样 / 数据包分段解析 / 风险检测 / 选股器 Tier 1 过滤与排名 / 综合评分 / PDF 文本导出。
 
 ## License
 

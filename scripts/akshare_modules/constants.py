@@ -25,6 +25,7 @@ SINA_INCOME_MAP = {
     "fv_value_chg_gain": "公允价值变动收益",
     "invest_income": "投资收益",
     "asset_disp_income": "资产处置收益",
+    "oth_income": "其他收益",
     "operate_profit": "营业利润",
     "non_oper_income": "营业外收入",
     "non_oper_exp": "营业外支出",

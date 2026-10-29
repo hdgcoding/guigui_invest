@@ -31,6 +31,17 @@ from typing import Dict, List, Optional, Tuple
 
 import pdfplumber
 
+# Display names for the 7 target sections (used by text exports)
+SECTION_NAMES: Dict[str, str] = {
+    "P2": "公司治理",
+    "P3": "会计政策",
+    "P4": "应收账款",
+    "P6": "合并报表",
+    "P13": "风险提示",
+    "MDA": "管理层讨论与分析",
+    "SUB": "主要子公司",
+}
+
 
 # ---------------------------------------------------------------------------
 # Feature #38: SECTION_KEYWORDS for 5 target sections
@@ -688,11 +699,117 @@ Examples:
         help="Print progress messages during extraction",
     )
     parser.add_argument(
+        "--text-output",
+        default=None,
+        help="Also write a consolidated markdown of section texts "
+             "(default: <output dir>/pdf_sections_text.md when --full-text given)",
+    )
+    parser.add_argument(
+        "--full-text",
+        action="store_true",
+        help="Also dump the FULL page text split into part files "
+             "(pdf_sections_text_fulltext_partN.md, ~120K chars each) "
+             "for GLM text-first reading",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print parsed arguments and exit without processing",
     )
     return parser.parse_args(args)
+
+
+def write_text_exports(pages_text: List[Tuple[int, str]],
+                       contexts: Dict[str, Optional[str]],
+                       metadata: dict,
+                       text_output: str,
+                       full_text: bool = False,
+                       full_text_part_chars: int = 120_000) -> list[str]:
+    """Write GLM-friendly text exports (PDF-first 深度分析, 文本优先模式).
+
+    1. `text_output` (pdf_sections_text.md): the 7 target sections' context
+       text, consolidated into one markdown file.
+    2. If full_text=True: also dump ALL page text split into part files
+       (pdf_fulltext_part1.md, part2, ...) of ~full_text_part_chars each,
+       so the agent can read the whole annual report as plain text.
+
+    Returns list of files written.
+    """
+    written = []
+
+    # --- Sections digest ---
+    lines = [
+        f"# 年报章节提取 — {metadata.get('pdf_file', '')}",
+        "",
+        f"*提取时间: {metadata.get('extract_time', '')} · "
+        f"共 {metadata.get('total_pages', 0)} 页 · "
+        f"命中 {metadata.get('sections_found', 0)}/{metadata.get('sections_total', 0)} 章节*",
+        "",
+        "> 本文件由 pdf_preprocessor.py 从年报 PDF 提取的**文本**，供 GLM 文本优先阅读。",
+        "> 章节上下文已按关键词定位截取；完整原文见 pdf_fulltext_part*.md（如已生成）。",
+        "",
+        "---",
+        "",
+    ]
+    for sid, name in SECTION_NAMES.items():
+        lines.append(f"## {sid} · {name}")
+        lines.append("")
+        text = contexts.get(sid)
+        if text:
+            lines.append(text)
+        else:
+            lines.append(f"*[{sid} 未在 PDF 中定位到，Agent 可用全文分片或 WebSearch 补充]*")
+        lines.append("")
+    out_dir = os.path.dirname(text_output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(text_output, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    written.append(text_output)
+
+    # --- Full text parts ---
+    if full_text:
+        base, _ext = os.path.splitext(text_output)
+        total_chars = sum(len(t) for _pn, t in pages_text)
+        n_parts = max(1, -(-total_chars // full_text_part_chars))
+        part_no = 1
+        buf: list[str] = []
+        buf_chars = 0
+        first_page: Optional[int] = None
+
+        def _flush(part_no: int, buf: list[str], first_page: Optional[int]) -> str:
+            path = f"{base}_fulltext_part{part_no}.md"
+            header = [
+                f"# 年报全文分片 {part_no}/{n_parts}",
+                "",
+                f"*源文件: {metadata.get('pdf_file', '')} · "
+                f"本片覆盖第 {first_page}-{last_page} 页*",
+                "",
+                "---",
+                "",
+            ]
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(header + buf))
+            return path
+
+        for page_num, text in pages_text:
+            if not text:
+                continue
+            if first_page is None:
+                first_page = page_num
+            piece = f"--- p.{page_num} ---\n{text}\n"
+            buf.append(piece)
+            buf_chars += len(piece)
+            if buf_chars >= full_text_part_chars:
+                last_page = page_num
+                written.append(_flush(part_no, buf, first_page))
+                part_no += 1
+                buf, buf_chars, first_page = [], 0, None
+        if buf:
+            last_page = pages_text[-1][0]
+            written.append(_flush(part_no, buf, first_page))
+
+    return written
 
 
 def _load_hints(hints_path: Optional[str]) -> Dict[str, dict]:
@@ -715,7 +832,9 @@ def _load_hints(hints_path: Optional[str]) -> Dict[str, dict]:
 
 
 def run_pipeline(pdf_path: str, output_path: str, verbose: bool = False,
-                 hints_path: Optional[str] = None) -> dict:
+                 hints_path: Optional[str] = None,
+                 text_output: Optional[str] = None,
+                 full_text: bool = False) -> dict:
     """Run the full extraction pipeline.
 
     Args:
@@ -723,6 +842,8 @@ def run_pipeline(pdf_path: str, output_path: str, verbose: bool = False,
         output_path: Path for JSON output.
         verbose: Print progress.
         hints_path: Optional path to toc_hints.json for TOC-based page overrides.
+        text_output: Optional path for consolidated section-text markdown.
+        full_text: Also dump full page text into part files next to text_output.
 
     Returns:
         The output dict written to JSON.
@@ -784,6 +905,17 @@ def run_pipeline(pdf_path: str, output_path: str, verbose: bool = False,
     print(f"[4/4] Writing output to {output_path}...")
     result = write_output(contexts, pdf_path, total_pages, output_path)
 
+    # Optional: GLM-friendly text exports (PDF-first 文本优先模式)
+    if text_output or full_text:
+        if text_output is None:
+            out_dir = os.path.dirname(output_path) or "."
+            text_output = os.path.join(out_dir, "pdf_sections_text.md")
+        files = write_text_exports(pages_text, contexts,
+                                   result["metadata"], text_output,
+                                   full_text=full_text)
+        for fp in files:
+            print(f"  text export: {fp}")
+
     found = result["metadata"]["sections_found"]
     total = result["metadata"]["sections_total"]
     print(f"Done: {found}/{total} sections found")
@@ -799,12 +931,16 @@ def main():
         print(f"  PDF: {args.pdf}")
         print(f"  Output: {args.output}")
         print(f"  Hints: {args.hints}")
+        print(f"  Text output: {args.text_output}")
+        print(f"  Full text: {args.full_text}")
         print(f"  Verbose: {args.verbose}")
         return
 
     try:
         result = run_pipeline(args.pdf, args.output, verbose=args.verbose,
-                              hints_path=args.hints)
+                              hints_path=args.hints,
+                              text_output=args.text_output,
+                              full_text=args.full_text)
         found = result["metadata"]["sections_found"]
         total = result["metadata"]["sections_total"]
         print(f"Extracted {found}/{total} sections -> {args.output}")
