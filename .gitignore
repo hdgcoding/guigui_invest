@@ -12,3 +12,9 @@ __pycache__/
 .env
 *.egg-info/
 .DS_Store
+
+# Standard OpenCode skill assets are project sources, even when globally ignored.
+!.opencode/
+!.opencode/skills/
+!.opencode/skills/turtle-analysis/
+!.opencode/skills/turtle-analysis/SKILL.md

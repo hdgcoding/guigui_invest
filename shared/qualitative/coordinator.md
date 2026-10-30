@@ -2,7 +2,7 @@
 
 > **角色**：你是项目经理。职责：(1) 验证输入；(2) 加载数据；(3) 启动定性分析；(4) 交付完整报告。
 >
-> **架构变更 (v2)**：PDF-first 数据流。年报 PDF 直接载入 context，不经过中间格式化步骤。
+> **架构变更 (v2.1)**：先读 `shared/analysis_contract.md`。PDF-first采用文本优先（预处理摘要→按需全文分片→必要时原PDF核表），扫描件需OCR/外部来源补充。
 > AKShare 数据仅作为历史序列补充。
 
 ---
@@ -11,13 +11,13 @@
 
 | 输入项 | 示例 | 必需？ |
 |--------|------|--------|
-| 股票代码或名称 | `600690` / `海尔智家` / `0001.HK` / `AAPL` | 必需 |
+| 股票代码或名称 | `600690` / `海尔智家`（仅A股） | 必需 |
 | 年报 PDF | 本地文件路径 或 URL | 可选（有则跳过 WebSearch） |
 
 **解析规则**：
 1. 从用户消息中提取股票代码/名称
-2. 若用户提供了 PDF 链接/路径 → 下载到 `{output_dir}/`，文件名约定 `{code}_{year}_年报.pdf`（如 `600887_2024_年报.pdf`，由 scripts/download_report.py 产出）；查找已有 PDF 用 glob `*{year}*年报*.pdf`（与 `.claude/commands/business-analysis.md` Step 1B 一致）
-3. 代码格式化：A股 → `XXXXXX.SH/SZ`；港股 → `XXXXX.HK`；美股 → `AAPL.US`
+2. PDF下载到 `{output_dir}/`，查找 `*{year}*年报*.pdf`（与 `.opencode/command/business-analysis.md` 同步）。
+3. 仅支持A股，代码通过 `scripts/config.py` 校验；不执行港美股历史分支。
 
 ---
 
@@ -27,8 +27,8 @@
 ┌──────────────────────────────────────────────────────────┐
 │  Step 1：数据采集                                          │
 │  ┌──────────────────┐  ┌──────────────────┐              │
-│  │ 1A AKShare数据    ‖ │ 1B PDF 下载+载入  │              │
-│  │ → data_pack_      │  │ → context 直接读取│              │
+│  │ 1A AKShare数据    ‖ │ 1B PDF 下载+提取  │              │
+│  │ → data_pack_      │  │ → 摘要/全文分片  │              │
 │  │   market.md       │  │                  │              │
 │  └────────┬─────────┘  └──────────────────┘              │
 │           │ (1A 完成后串行, <5s)                          │
@@ -112,10 +112,8 @@ python3 scripts/quality_control.py \
 
 **PDF 读取策略**：
 
-1. **先读目录**（通常前 3-5 页）→ 确认 PDF 类型和章节页码
-2. **判断 PDF 类型**：
-   - 纯文本 PDF → 直接 Read 关键章节
-   - 扫描/图片 PDF → fallback 到 `python3 scripts/pdf_preprocessor.py`
+1. 运行 `.venv/bin/python scripts/pdf_preprocessor.py --pdf <pdf> --output {output_dir}/pdf_sections.json --text-output {output_dir}/pdf_sections_text.md --full-text`。
+2. 读摘要→根据manifest/page标记按需读全文分片；表格有歧义时核对原PDF。空文本/扫描件必须走OCR或WebSearch补充；本脚本没有OCR能力。
 3. **按需读取关键章节**（优先级排序）：
 
 | 优先级 | 章节 | 典型页码范围 | 分析用途 |
@@ -127,9 +125,9 @@ python3 scripts/quality_control.py \
 | P1 | 股东情况 | 101-108 | D4 股权结构 |
 | P2 | 财务报告附注 | 115+ | D6 控股结构、关联交易 |
 
-每次 Read 最多 20 页，按优先级分批读取。
+文本按需分批读取；必须记录实际阅读页码/分片，不能把7类关键词命中称为读完年报。
 
-**1C-fallback：WebSearch 降级（仅当 PDF 下载失败时）**：
+**1C-fallback：WebSearch 降级（PDF下载失败、扫描或乱码时）**：
 - 使用 WebSearch 补充 §7（管理层）、§8（行业）、§10（MD&A）
 - 搜索时优先获取最近完整财年数据，WebSearch 关键词中加入"年报""全年"以避免返回半年报/季报结果
 - 在报告中标注数据来源为 WebSearch，可信度相应降低
@@ -148,11 +146,9 @@ Agent(
   年报 PDF 文件：{output_dir}/{pdf_filename}
 
   步骤：
-  1. 使用 Read 工具读取 PDF 前 3-5 页，获取目录页，定位附注各章节的页码。
-  2. 判断 PDF 类型（纯文本 or 扫描件）：
-     - 若 Read 返回清晰的中文文字和表格 → 纯文本 PDF，继续步骤 3
-     - 若 Read 返回乱码或极少文字 → 扫描件，输出标记 `PDF_TYPE=SCANNED` 后停止
-  3. 按优先级从 PDF 中直接 Read 对应章节（每次最多 20 页）：
+   1. 先读pdf_sections_text.md及manifest，定位关键词上下文与候选页码。
+   2. 若无有效文本/乱码，输出PDF_TYPE=SCANNED，转外部补充，不假装OCR已执行。
+   3. 按优先级读取对应全文分片，必要时核对原PDF：
      P0: 非经常性损益明细(P13)、受限现金明细(P2)
      P1: 应收账款账龄(P3)、关联交易(P4)、或有负债与承诺(P6)
      P2: 主要控股参股公司(SUB，条件触发：仅控股公司结构)
@@ -165,20 +161,8 @@ Agent(
   description = "PDF附注提取(供下游策略)"
 )
 
-# 扫描件 fallback（仅当上述 Agent 返回 PDF_TYPE=SCANNED 时执行）
-Bash(
-  command = "python3 scripts/pdf_preprocessor.py --pdf {output_dir}/{pdf_filename} --output {output_dir}/pdf_sections.json",
-  description = "PDF预处理-扫描件fallback"
-)
-Agent(
-  prompt = """
-  请阅读 {workspace}/strategies/turtle/phase2_PDF解析.md 中的完整指令。
-  pdf_sections.json 文件路径：{output_dir}/pdf_sections.json
-  公司名称：{company_name}
-  将解析结果写入：{output_dir}/data_pack_report.md
-  """,
-  description = "PDF精提取-扫描件fallback"
-)
+# 扫描件不能用文本提取脚本冒充OCR；转WebSearch或真实OCR结果，
+# 没有有效文本时不得把旧pdf_sections.json当作本次成功提取。
 ```
 
 **无 PDF 时**：跳过此步骤。下游策略在无 `data_pack_report.md` 时使用降级方案。
@@ -209,7 +193,7 @@ Agent(
   数据文件：
     - AKShare 数据：{output_dir}/data_pack_market.md
     - Python 预算指标：{output_dir}/computed_metrics.md（CM§1-§5，正文引用、禁止重算，标 [src: CM§N]）
-    - 年报 PDF：已在 context 中加载（如有）
+     - 年报文本：pdf_sections_text.md + 按需全文分片及manifest（如有）
 
   按照 qualitative_assessment.md 的 6 维度框架进行完整分析。
   特别注意"收入质量分解"和"交叉验证"部分，并严格遵守"计算纪律"与"溯源标注语法"。
@@ -236,7 +220,7 @@ Agent(
   请阅读 {shared_dir}/qualitative/agents/cleanroom_audit.md 中的完整指令并严格执行。
 
   目标公司：{stock_code}（{company_name}）
-  允许读取：{output_dir}/data_pack_market.md、年报 PDF（context 中）
+   允许读取：{output_dir}/data_pack_market.md、年报文本摘要/分片及必要的PDF页
   禁止读取：{output_dir}/qualitative_report.md、{output_dir}/computed_metrics.md、audit.md、consistency_report.md
 
   coordinator 追加的公司特定指标（1-2 个）：{company_specific_metrics}
@@ -309,7 +293,7 @@ Agent(
    - `FIX_REQUIRED` → 执行修复环
 2. **修复环**：coordinator 按 `audit.md` 问题清单的每个"原文→修正"对，用 Edit 精确改写
    `qualitative_report.md`（原文需唯一可定位）。
-3. 修复后**重跑 3A**（report_consistency.py）确认冲突下降 + 硬门槛通过。
+3. 修复后重跑3A，并重新执行3B绑定新报告/metrics哈希；不能沿用修改前PASS。最终运行`report_consistency.py --report {output_dir}/qualitative_report.md --report-type qualitative --gates --metrics {output_dir}/decision_metrics.json --require-audit {output_dir}/audit.md --require-cleanroom {output_dir}/cleanroom_metrics.md`。
 4. **交付闸**：若仍存在 **critical** 未修复 → **禁止交付**，向用户报告未通过审计的原因；
    修复环最多执行 **1 次**（避免无限循环），1 次后仍有 critical 由用户裁决。
 
@@ -326,11 +310,7 @@ python3 scripts/report_to_html.py \
   --output {output_dir}/qualitative_report.html \
   --standalone
 
-# 网站部署（引用外部 CSS）
-# 注意：本地目录名就是 Teracnejiang.com（历史拼写，勿"修正"），网站域名为 terancejiang.com
-python3 scripts/report_to_html.py \
-  --input {output_dir}/qualitative_report.md \
-  --output ~/Projects/Teracnejiang.com/zh/stock/{slug}.html
+# 部署到外部网站目录属于额外操作，仅用户明确给出目标并授权后执行。
 ```
 
 ---
@@ -340,7 +320,7 @@ python3 scripts/report_to_html.py \
 | 异常情况 | 处理方式 |
 |---------|---------|
 | PDF 下载失败 | 提示用户重新提供链接；fallback 到 WebSearch |
-| PDF 为扫描件 | 定性分析：使用 pdf_preprocessor.py 处理；附注提取：fallback 到 pdf_preprocessor.py + Agent |
+| PDF 为扫描件/乱码 | 使用真实OCR结果或WebSearch补充，标明PDF未完成；不把普通文本提取当OCR |
 | PDF 附注提取失败 | 不影响定性分析；下游策略使用降级方案（无 data_pack_report.md） |
 | 个别 AKShare 接口失败 | 该段标注"数据缺失"，Agent 用 WebSearch 补充 |
 | PDF + AKShare 数据冲突 | 以 PDF 为准，标注差异 |

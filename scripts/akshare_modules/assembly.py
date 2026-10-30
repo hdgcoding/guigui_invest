@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 
 import pandas as pd
+from financial_contracts import statement_issues
 
 from format_utils import format_table, format_header
 
@@ -28,6 +29,14 @@ class AssemblyMixin:
             f"> 以下指标基于 §1-§16 原始数据确定性计算，无 LLM 判断成分。Phase 3 可直接引用。{self._unit_label()}。",
             "",
         ]
+        issues = statement_issues(self._store)
+        self._store["statement_issues"] = issues
+        for key in ("factor3_sensitivity", "payout_crosscheck", "_true_cash_rev", "_w_total"):
+            self._store.pop(key, None)
+        if issues:
+            lines.append("⚠️ 跨表口径未通过校验，暂停§17数值输出（不得据此生成买点）：")
+            lines.extend(f"- {issue}" for issue in issues)
+            return "\n".join(lines)
 
         sub_methods = [
             self._compute_financial_trends,
@@ -98,6 +107,7 @@ class AssemblyMixin:
             format_header(1, f"数据包 — {ts_code}"),
             "",
             f"*生成时间: {timestamp}*",
+            f"*财务采集时间: {self._store.get('_financial_collected_at', timestamp)}*",
             f"*数据来源: AKShare (新浪财经/东方财富/百度估值)*",
             f"*金额单位: {self._unit_label()} (除特殊标注)*",
             "",
@@ -109,7 +119,9 @@ class AssemblyMixin:
     @staticmethod
     def _check_staleness(content: str) -> int:
         """Days since the data pack was generated (999 if unparsable)."""
-        m = re.search(r"\*生成时间:\s*(\d{4}-\d{2}-\d{2})", content)
+        m = re.search(r"\*财务采集时间:\s*(\d{4}-\d{2}-\d{2})", content)
+        if not m:
+            m = re.search(r"\*生成时间:\s*(\d{4}-\d{2}-\d{2})", content)
         if not m:
             return 999
         try:
@@ -119,48 +131,48 @@ class AssemblyMixin:
         except Exception:
             return 999
 
-    _REFRESH_SECTIONS = {"1", "2", "11", "14"}
+    _REFRESH_SECTIONS = {"1", "2", "11", "14", "17"}
 
     def refresh_market_sections(self, ts_code: str, existing_content: str) -> str:
-        """Re-fetch market-sensitive sections and merge with existing pack."""
-        _header, sections, footer = self._parse_sections(existing_content)
+        """Rehydrate statements via TTL cache and recompute all dependencies.
 
-        fetch_map = {
-            "1": ("1. 基本信息", self.get_basic_info),
-            "2": ("2. 市场行情", self.get_market_data),
-            "11": ("11. 十年周线行情", self.get_weekly_prices),
-            "14": ("14. 无风险利率", self.get_risk_free_rate),
-        }
-
-        new_sections = []
-        for key, text in sections:
-            if key in fetch_map:
-                name, method = fetch_map[key]
-                try:
-                    print(f"  Refreshing {name}...")
-                    fresh_md = method(ts_code)
-                    if not fresh_md.endswith("\n"):
-                        fresh_md += "\n"
-                    new_sections.append((key, fresh_md))
-                except Exception as e:  # noqa: BLE001
-                    print(f"  ⚠️ Failed to refresh {name}: {e}, keeping old data")
-                    new_sections.append((key, text))
-            else:
-                new_sections.append((key, text))
-
-        new_header = self._build_header(ts_code)
-        new_header += "*刷新模式: --refresh-market（仅更新 §1/§2/§11/§14）*\n\n"
-
-        parts = [new_header]
-        for _key, text in new_sections:
+        Market caches are bypassed. Never retain an old price-dependent §17 or
+        silently carry forward a failed market request as fresh data.
+        """
+        _, old_sections, _ = self._parse_sections(existing_content)
+        financial_date = re.search(r"\*财务采集时间:\s*([^*]+)\*", existing_content)
+        if not financial_date:
+            financial_date = re.search(r"\*生成时间:\s*([^*]+)\*", existing_content)
+        self._store = {}
+        if financial_date and self._check_staleness(existing_content) <= 7:
+            self._store["_financial_collected_at"] = financial_date.group(1)
+        self._refresh_market = True
+        try:
+            fresh = self.assemble_data_pack(ts_code)
+        finally:
+            self._refresh_market = False
+        header, new_sections, footer = self._parse_sections(fresh)
+        # Agent-only industry/MD&A research has its own as-of date. Preserve it
+        # with a stale-source notice; never merge it into deterministic figures.
+        old = dict(old_sections)
+        parts = [header + "*刷新模式: 行情强制刷新，财报按TTL重新载入，§17全量重算*\n\n"]
+        for key, text in new_sections:
+            if key in {"8", "10"} and key in old and "待Agent" not in old[key]:
+                text = old[key].rstrip()
+                notice = "> 此研究沿用上期；须重新核查时效。"
+                if notice not in text:
+                    text += "\n\n" + notice
+                text += "\n\n"
+            elif key in {"7", "9"} and key in old:
+                # Governance/segment sections may include human/Agent research
+                # below endpoint tables. Keep it separately marked as historical
+                # rather than silently erasing it during a market refresh.
+                marker = "### 上期研究留存（非本次已核实数据）"
+                previous = old[key]
+                archive = previous.split(marker, 1)[1] if marker in previous else previous.split("\n", 1)[-1]
+                text = text.rstrip() + "\n\n" + marker + "\n\n" + archive.strip() + "\n\n"
             parts.append(text)
-        result = "".join(parts)
-
-        if footer:
-            result = result.rstrip("\n") + footer
-        else:
-            result = result.rstrip("\n") + "\n"
-        return result
+        return "".join(parts).rstrip() + footer + "\n"
 
     # ------------------------------------------------------------------
     # Full assembly
@@ -168,7 +180,12 @@ class AssemblyMixin:
 
     def assemble_data_pack(self, ts_code: str) -> str:
         """Assemble complete data_pack_market.md combining all sections."""
+        # A failed fetch for the next stock/refresh must not reuse the previous
+        # stock's statements, dividends, supplemental evidence or derived grids.
+        keep = ("as_of", "_financial_collected_at") if getattr(self, "_refresh_market", False) else ("as_of",)
+        self._store = {key: self._store[key] for key in keep if key in self._store}
         lines = self._build_header(ts_code).split("\n")
+        self._supplement_applied = False
 
         sections = [
             ("1. 基本信息", self.get_basic_info),
@@ -194,10 +211,16 @@ class AssemblyMixin:
                 section_md = method(ts_code)
                 lines.append(section_md)
                 lines.append("")
-                completed += 1
+                if not any(marker in section_md for marker in ("数据缺失", "暂无", "无年报数据", "获取失败")):
+                    completed += 1
             except Exception as e:  # noqa: BLE001
                 lines.append(format_header(2, name))
                 lines.append(f"\n数据获取失败: {e}\n")
+
+        if getattr(self, "_supplement_path", None):
+            from financial_supplement import apply_supplement
+            apply_supplement(self, self._supplement_path, ts_code)
+            self._supplement_applied = True
 
         # Audit info (sub-section of §7)
         try:
@@ -226,6 +249,8 @@ class AssemblyMixin:
             lines.append("")
 
         # §17 derived metrics
+        if self._supplement_applied:
+            lines.append("> 已载入来源核对补充：" + str(self._supplement_path) + "。这不是独立审计PASS。")
         try:
             print("  Computing 17. 衍生指标...")
             lines.append(self.compute_derived_metrics(ts_code))
@@ -303,12 +328,14 @@ class AssemblyMixin:
                         lines.append(f"- [{w['type']}|{w['severity']}] {w['message']}")
                     lines.append("")
         else:
-            lines.append("未检测到异常。")
+            lines.append("已覆盖字段未检测到异常；不代表缺失项目通过审计。")
             lines.append("")
 
         lines.append("")
         lines.append("> AKShare 版数据覆盖说明：§3P/§4P 母公司报表缺失（请以年报 PDF 附注补充），"
-                     "§5 不含折旧摊销附表（D&A 相关衍生指标已降级），审计意见待 Agent WebSearch 补充。")
+                     "§5 D&A通过东财/同花顺补充，缺项保持未知；审计意见未核实，不得视为通过。")
+        for issue in self._store.get("statement_issues", []):
+            lines.append(f"- [STATEMENT_VERSION|高] {issue}")
         lines.append("")
 
         lines.append("### 13.2 Agent WebSearch 补充")
@@ -319,7 +346,17 @@ class AssemblyMixin:
         lines.append("---")
         lines.append(f"*共 {completed}/{len(sections)} 个数据板块成功获取*")
 
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        if self._supplement_applied:
+            from .constants import SINA_INCOME_MAP, SINA_BALANCE_MAP
+            header, parts, footer = self._parse_sections(result)
+            replacements = {}
+            for key, section, symbol, mapping in (("income_parent", "3P", "利润表", SINA_INCOME_MAP),
+                                                 ("balance_sheet_parent", "4P", "资产负债表", SINA_BALANCE_MAP)):
+                if key in self._store:
+                    replacements[section] = self._render_parent_data(section, symbol, mapping, key) + "\n"
+            result = header + "".join(replacements.get(key, text) for key, text in parts) + footer
+        return result
 
 
 class WarningsCollector:

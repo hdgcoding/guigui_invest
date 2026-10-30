@@ -75,9 +75,10 @@ def main() -> int:
     parser.add_argument("--code", required=True, help="Stock code, e.g. 600887 or 600887.SH")
     parser.add_argument("--output", default=None, help="Output markdown path")
     parser.add_argument("--no-cache", action="store_true", help="Bypass TTL cache")
+    parser.add_argument("--supplement", help="Source-reconciled financial_supplement.json (raw yuan, explicit periods/scopes)")
     parser.add_argument("--cache-refresh", action="store_true", help="Invalidate all cached data")
     parser.add_argument("--refresh-market", action="store_true",
-                        help="Only refresh §1/§2/§11/§14 of an existing data pack")
+                        help="Refresh market inputs, rehydrate financials via TTL, recompute §17")
     parser.add_argument("--dry-run", action="store_true", help="Validate code and exit")
     args = parser.parse_args()
 
@@ -94,6 +95,8 @@ def main() -> int:
     ts_code, name, output_path = resolve_output_path(args.code, args.output)
 
     client = AKShareClient(no_cache=args.no_cache)
+    default_supplement = os.path.join(os.path.dirname(output_path), "financial_supplement.json")
+    client._supplement_path = args.supplement or (default_supplement if os.path.isfile(default_supplement) else None)
 
     if args.cache_refresh:
         client._cache.clear()
@@ -112,16 +115,20 @@ def main() -> int:
                 print(f"⚠️ 数据包已 {age_days} 天未更新，执行完整采集")
             else:
                 content = client.refresh_market_sections(ts_code, existing)
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
                 with open(output_path, "w", encoding="utf-8") as f:
                     f.write(content)
+                from data_snapshot import write_snapshot
+                write_snapshot(client, os.path.dirname(output_path) or ".", ts_code)
                 print(f"✓ 市场数据已刷新: {output_path}")
                 return 0
 
     content = client.assemble_data_pack(ts_code)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
+    from data_snapshot import write_snapshot
+    write_snapshot(client, os.path.dirname(output_path) or ".", ts_code)
     print(f"✓ 数据包已生成: {output_path}")
     return 0
 

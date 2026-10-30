@@ -35,14 +35,9 @@ from akshare_modules.constants import (  # noqa: E402
 )
 from cache_utils import ScreenerCache  # noqa: E402
 from screener_config import ScreenerConfig  # noqa: E402
+from financial_contracts import debt, depreciation, annual_dividends, statement_issues  # noqa: E402
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
-
-SECTION_NAMES = {
-    "P2": "公司治理", "P3": "会计政策", "P4": "应收账款", "P6": "合并报表",
-    "P13": "风险提示", "MDA": "管理层讨论与分析", "SUB": "主要子公司",
-}
-
 
 class AKShareScreener:
     """Two-tier stock screener backed by AKShare bulk + per-stock endpoints."""
@@ -53,6 +48,7 @@ class AKShareScreener:
         self.client = AKShareClient()
         # Reuse the collector's per-stock TTL cache (financial 7d / market 24h)
         self._rf_cache: float | None = None
+        self.diagnostics = []
 
     # ------------------------------------------------------------------
     # Generic cached bulk fetch
@@ -132,20 +128,21 @@ class AKShareScreener:
             "n_profit": pd.to_numeric(df["净利润-净利润"], errors="coerce"),
             "industry": df["所处行业"].astype(str),
         })
-        return out
+        return out.drop_duplicates("code")
 
     def _fetch_listing_dates(self) -> pd.DataFrame:
         """Exchange name/code tables → code + list_date (YYYYMMDD)."""
         def _fetch():
             import akshare as ak
             frames = []
-            try:
-                sh = ak.stock_info_sh_name_code(symbol="主板A股")
-                frames.append(pd.DataFrame(
-                    {"code": sh["证券代码"].astype(str).str.zfill(6),
-                     "list_date": sh["上市日期"].astype(str)}))
-            except Exception:
-                pass
+            for board in ("主板A股", "科创板"):
+                try:
+                    sh = ak.stock_info_sh_name_code(symbol=board)
+                    frames.append(pd.DataFrame(
+                        {"code": sh["证券代码"].astype(str).str.zfill(6),
+                         "list_date": sh["上市日期"].astype(str)}))
+                except Exception:
+                    pass
             try:
                 sz = ak.stock_info_sz_name_code(symbol="A股列表")
                 frames.append(pd.DataFrame(
@@ -202,13 +199,13 @@ class AKShareScreener:
         cutoff = pd.Timestamp.now() - pd.Timedelta(days=365)
         ttm = all_plans[all_plans["implemented"] & all_plans["dps"].notna()
                         & (all_plans["dps"] > 0)
-                        & (all_plans["ex_date"] >= cutoff)]
+                        & (all_plans["ex_date"] >= cutoff)
+                        & (all_plans["ex_date"] <= pd.Timestamp.now())]
 
         dps_ttm = ttm.groupby("code")["dps"].sum().rename("dps_ttm")
 
         # Latest share count: most recent implemented plan per stock
-        with_shares = all_plans[all_plans["implemented"]
-                                & all_plans["shares"].notna()].copy()
+        with_shares = all_plans[all_plans["shares"].notna() & (all_plans["shares"] > 0)].copy()
         with_shares = with_shares.sort_values("ex_date", ascending=False)
         latest_shares = (with_shares.groupby("code").first()["shares"]
                          .rename("total_shares"))
@@ -235,8 +232,26 @@ class AKShareScreener:
         if not fhps.empty:
             df = df.merge(fhps, on="code", how="left")
 
+        for col in ("eps", "bps", "dps_ttm", "total_shares", "n_profit"):
+            if col not in df:
+                df[col] = float("nan")
+        if "list_date" not in df:
+            df["list_date"] = pd.Series(pd.NA, index=df.index, dtype="string")
+        if "industry" not in df:
+            df["industry"] = "未核实"
+        self.diagnostics = [{"field": col, "missing": int(df[col].isna().sum()), "total": len(df)}
+                            for col in ("eps", "bps", "total_shares", "list_date")]
+        # Independent of dividend history: a loss-making non-payer can enter
+        # observation via explicitly labelled annual weighted-share proxy.
+        implied_shares = df["n_profit"] / df["eps"].where(df["eps"] != 0)
+        needs_shares = df["total_shares"].isna()
+        df["shares_basis"] = "分红方案股本（非实时）"
+        df.loc[needs_shares, "shares_basis"] = "年报净利润/EPS推算加权平均股本（非实时）"
+        df["total_shares"] = df["total_shares"].fillna(implied_shares.where(implied_shares > 0))
+        df["market_cap_basis"] = "价格×历史股本代理；Tier2必须重新核实"
+
         # Derived valuation columns
-        df["pe_ttm"] = df["close"] / df["eps"].where(df["eps"] > 0)   # 静态PE(近似)
+        df["pe_static"] = df["close"] / df["eps"].where(df["eps"] > 0)
         df["pb"] = df["close"] / df["bps"].where(df["bps"] > 0)
         df["dv_ttm"] = df["dps_ttm"] / df["close"] * 100               # %
         df["total_mv"] = df["close"] * df["total_shares"] / 1e4        # 万元
@@ -256,6 +271,10 @@ class AKShareScreener:
 
         cfg = self.config
         today = datetime.now()
+        df = df.copy()
+        # Compatibility with callers of the old API; exports use honest name.
+        if "pe_static" not in df:
+            df["pe_static"] = df.get("pe_ttm", float("nan"))
 
         # 1. Remove ST/PT/退市整理
         df = df[~df["name"].str.contains(r"\*ST|ST|PT|退市|退", na=False, regex=True)].copy()
@@ -274,15 +293,15 @@ class AKShareScreener:
         df = df[df["total_mv"] / 10000 >= cfg.min_market_cap_yi].copy()
 
         # 4. Liquidity proxy: daily turnover amount ≥ 0.1亿 (sina spot无换手率)
-        df = df[df["amount"].notna() & (df["amount"] >= 1e7)].copy()
+        df = df[df["amount"].notna() & (df["amount"] >= cfg.min_daily_amount_yuan)].copy()
 
         # 5. PB window
         df = df[df["pb"].notna()].copy()
         df = df[(df["pb"] > 0) & (df["pb"] <= cfg.max_pb)].copy()
 
         # 6. Dual-channel PE split
-        pe_valid = df["pe_ttm"].notna()
-        main_mask = pe_valid & (df["pe_ttm"] > 0) & (df["pe_ttm"] <= cfg.max_pe)
+        pe_valid = df["pe_static"].notna()
+        main_mask = pe_valid & (df["pe_static"] > 0) & (df["pe_static"] <= cfg.max_pe)
         obs_mask = ~pe_valid & df["eps"].notna() & (df["eps"] < 0)
 
         main_df = df[main_mask].copy()
@@ -310,7 +329,7 @@ class AKShareScreener:
             dv_max = main["dv_ttm"].max()
             main["_dv_norm"] = main["dv_ttm"] / dv_max if dv_max > 0 else 0
 
-            pe_inv = 1.0 / main["pe_ttm"]
+            pe_inv = 1.0 / main["pe_static"]
             pe_max = pe_inv.max()
             main["_pe_norm"] = pe_inv / pe_max if pe_max > 0 else 0
 
@@ -345,7 +364,9 @@ class AKShareScreener:
             key = {"利润表": "income", "资产负债表": "balance_sheet",
                    "现金流量表": "cashflow"}[symbol]
             c._store[key] = c._fetch_sina_statement(ts_code, symbol, col_map)
-        fina = c._fetch_fina_indicators_df(num)
+        if not c._store["cashflow"].empty:
+            c._store["cashflow"] = c._supplement_da(ts_code, c._store["cashflow"])
+        fina = c._merge_derived_indicators(c._fetch_fina_indicators_df(num))
         if not fina.empty:
             c._store["fina_indicators"] = fina
         divs = c._fetch_dividends_df(num)
@@ -356,6 +377,7 @@ class AKShareScreener:
         weekly = c._fetch_weekly(num, years=10)
         if not weekly.empty:
             c._store["weekly_prices"] = weekly
+            c._store["price_basis"] = "unadjusted"
 
     def _latest_annual_row(self, key: str) -> pd.Series | None:
         df = self.client._get_annual_df(key)
@@ -381,6 +403,7 @@ class AKShareScreener:
 
     def _check_hard_vetoes(self, ts_code: str) -> tuple[bool, str]:
         num = ts_code.split(".")[0]
+        self._veto_checks = {"audit_status": "未核实（不等于通过）", "pledge_status": "未核实（不等于通过）"}
         try:
             def _fetch():
                 import akshare as ak
@@ -388,6 +411,8 @@ class AKShareScreener:
             df = self._bulk_cached(f"pledge:{num}", 24 * 3600, _fetch)
             if df is not None and not df.empty and "占总股本比例" in df.columns:
                 ratios = pd.to_numeric(df["占总股本比例"], errors="coerce").dropna()
+                if not ratios.empty:
+                    self._veto_checks["pledge_status"] = "接口有数据，需核对未解押范围"
                 if not ratios.empty and float(ratios.sum()) > self.config.max_pledge_pct:
                     return False, f"pledge_ratio={ratios.sum():.1f}% > {self.config.max_pledge_pct}%"
         except Exception:
@@ -401,8 +426,11 @@ class AKShareScreener:
 
     def _check_financial_quality(self, channel: str) -> tuple[bool, dict[str, Any]]:
         cfg = self.config
-        metrics: dict[str, Any] = {}
-        fi = self.client._store.get("fina_indicators")
+        metrics: dict[str, Any] = {k: None for k in ("roe_waa", "roe_metric", "gross_margin", "debt_to_assets")}
+        if statement_issues(self.client._store):
+            metrics["data_status"] = "报表期间/版本未核实"
+            return False, metrics
+        fi = self.client._merge_derived_indicators(self.client._store.get("fina_indicators", pd.DataFrame()))
 
         def _sf(v):
             try:
@@ -414,7 +442,9 @@ class AKShareScreener:
         if fi is not None and not fi.empty:
             annual = fi[fi["end_date"].astype(str).str.endswith("1231")]
             row = annual.iloc[0] if not annual.empty else fi.iloc[0]
-            metrics["roe_waa"] = _sf(row.get("roe_waa")) or _sf(row.get("roe"))
+            metrics["roe_waa"] = _sf(row.get("roe_waa"))
+            metrics["roe_metric"] = metrics["roe_waa"] if metrics["roe_waa"] is not None else _sf(row.get("roe"))
+            metrics["roe_basis"] = "加权ROE" if metrics["roe_waa"] is not None else "摊薄ROE（非加权）"
             metrics["gross_margin"] = _sf(row.get("grossprofit_margin"))
             metrics["debt_to_assets"] = _sf(row.get("debt_to_assets"))
         else:
@@ -425,7 +455,8 @@ class AKShareScreener:
                 np_p = _sf(inc.get("n_income_attr_p"))
                 eq = _sf(bs.get("total_hldr_eqy_exc_min_int"))
                 if np_p is not None and eq:
-                    metrics["roe_waa"] = np_p / eq * 100
+                    metrics["roe_metric"] = np_p / eq * 100
+                    metrics["roe_basis"] = "摊薄ROE（非加权）"
                 rev = _sf(inc.get("revenue"))
                 cost = _sf(inc.get("oper_cost"))
                 if rev and cost is not None:
@@ -438,14 +469,15 @@ class AKShareScreener:
                 if ta and tl is not None:
                     metrics["debt_to_assets"] = tl / ta * 100
 
-        if all(metrics.get(k) is None for k in
-               ("roe_waa", "gross_margin", "debt_to_assets")):
+        if any(metrics.get(k) is None for k in
+               ("roe_metric", "gross_margin", "debt_to_assets")):
+            metrics["data_status"] = "财务质量必需指标缺失，不通过"
             return False, metrics
 
         if channel == "observation":
             return self._check_obs_quality(metrics, cfg)
 
-        if metrics["roe_waa"] is not None and metrics["roe_waa"] < cfg.min_roe:
+        if metrics["roe_metric"] < cfg.min_roe:
             return False, metrics
         if metrics["gross_margin"] is not None and metrics["gross_margin"] < cfg.min_gross_margin:
             return False, metrics
@@ -455,7 +487,7 @@ class AKShareScreener:
 
     def _check_obs_quality(self, metrics: dict[str, Any],
                            cfg: ScreenerConfig) -> tuple[bool, dict[str, Any]]:
-        if metrics["roe_waa"] is not None and metrics["roe_waa"] < cfg.min_roe_obs:
+        if cfg.min_roe_obs is not None and metrics["roe_metric"] is not None and metrics["roe_metric"] < cfg.min_roe_obs:
             return False, metrics
         if metrics["gross_margin"] is not None and metrics["gross_margin"] < cfg.min_gross_margin:
             return False, metrics
@@ -484,7 +516,9 @@ class AKShareScreener:
         if cfg.obs_require_ocf_positive and (ocf is None or ocf <= 0):
             return False, metrics
 
-        fcf = (ocf or 0) - abs(capex or 0)
+        if ocf is None or capex is None:
+            return False, metrics
+        fcf = ocf - abs(capex)
         inc_row = self._latest_annual_row("income")
         revenue = _sf(inc_row.get("revenue")) if inc_row is not None else None
         if revenue is not None and revenue > 0:
@@ -528,26 +562,20 @@ class AKShareScreener:
         annual_inc = self.client._get_annual_df("income")
         years = [str(r["end_date"])[:4] for _, r in annual_inc.head(3).iterrows()]
         ratios = [payout[y] for y in years if y in payout]
-        result["M"] = sum(ratios) / len(ratios) if ratios else None
+        result["M"] = sum(ratios) / 3 if len(ratios) == 3 else None
 
-        # AA = 真实可支配现金结余 (latest year) ≈ OCF + V1 - V_deduct - |Capex|
-        AA = None
-        annual_cf = self.client._get_annual_df("cashflow")
-        if not annual_cf.empty and not annual_inc.empty:
-            cf_row = annual_cf.iloc[0]
-            inc_row = annual_inc.iloc[0]
-            ocf = self.client._safe_float(cf_row.get("n_cashflow_act"))
-            capex = abs(self.client._safe_float(cf_row.get("c_pay_acq_const_fiolta")) or 0)
-            v1 = self.client._safe_float(inc_row.get("asset_disp_income")) or 0
-            noi = self.client._safe_float(inc_row.get("non_oper_income")) or 0
-            oi = self.client._safe_float(inc_row.get("oth_income")) or 0
-            if ocf is not None:
-                AA = (ocf + v1 - (noi + oi) - capex) / 1e6  # 百万元
-        result["AA"] = AA
+        # Same default AA window as §17 (latest two annual cash surpluses).
+        self.client._compute_factor3_sensitivity_base()
+        summary = self.client._store.get("factor3_sensitivity", {})
+        aa_raw = summary.get("aa_selected")
+        AA = aa_raw / 1e6 if aa_raw is not None else None
+        result["AA_proxy"] = AA
+        result["R_basis"] = "合并OCF−Capex代理，未完成归母现金穿透"
 
         if AA is not None and result.get("M") is not None and mkt_cap > 0:
             R = AA * (result["M"] / 100) / mkt_cap * 100
-            result["R"] = R
+            result["R_proxy"] = R
+            result["R"] = None  # not a verified penetration-return metric
         else:
             result["R"] = None
 
@@ -585,26 +613,24 @@ class AKShareScreener:
             result["revenue"] = c._safe_float(inc_row.get("revenue"))
 
         if bs_row is not None:
-            cash = c._safe_float(bs_row.get("money_cap")) or 0
-            result["cash"] = cash / 1e6
-            ibd = 0.0
-            for col in ("st_borr", "lt_borr", "bond_payable", "non_cur_liab_due_1y"):
-                v = c._safe_float(bs_row.get(col))
-                if v:
-                    ibd += v / 1e6
-            result["ibd"] = ibd
-            gw = c._safe_float(bs_row.get("goodwill")) or 0
-            ta = c._safe_float(bs_row.get("total_assets")) or 0
-            result["goodwill"] = gw / 1e6
-            result["total_assets"] = ta / 1e6
-            if ta > 0:
+            cash = c._safe_float(bs_row.get("money_cap"))
+            result["cash"] = cash / 1e6 if cash is not None else None
+            ibd = debt(bs_row)
+            result["ibd"] = ibd / 1e6 if ibd is not None else None
+            minority = c._safe_float(bs_row.get("minority_int"))
+            result["minority_equity"] = minority / 1e6 if minority is not None else None
+            gw = c._safe_float(bs_row.get("goodwill"))
+            ta = c._safe_float(bs_row.get("total_assets"))
+            result["goodwill"] = gw / 1e6 if gw is not None else None
+            result["total_assets"] = ta / 1e6 if ta is not None else None
+            if gw is not None and ta is not None and ta > 0:
                 result["goodwill_ratio"] = gw / ta * 100
 
         if cf_row is not None:
-            ocf = c._safe_float(cf_row.get("n_cashflow_act")) or 0
-            capex = abs(c._safe_float(cf_row.get("c_pay_acq_const_fiolta")) or 0)
-            result["fcf"] = (ocf - capex) / 1e6
-            if mkt_cap > 0:
+            ocf = c._safe_float(cf_row.get("n_cashflow_act"))
+            capex = c._safe_float(cf_row.get("c_pay_acq_const_fiolta"))
+            result["fcf"] = (ocf - abs(capex)) / 1e6 if ocf is not None and capex is not None else None
+            if mkt_cap > 0 and result["fcf"] is not None:
                 result["fcf_yield"] = result["fcf"] / mkt_cap * 100
 
             fcf_list = []
@@ -619,23 +645,25 @@ class AKShareScreener:
 
         rev = result.get("revenue")
         if rev and result.get("fcf") is not None:
-            result["fcf_margin"] = result["fcf"] / rev * 100
+            result["fcf_margin"] = result["fcf"] * 1e6 / rev * 100
 
         # EBITDA = 营业利润 + 财务费用 + D&A (sina 无 D&A → 0, 偏保守)
-        if result.get("oper_profit") is not None:
-            fin_exp = c._safe_float(inc_row.get("finance_exp")) or 0 if inc_row is not None else 0
-            ebitda = (result["oper_profit"] + abs(fin_exp)) / 1e6
-            if ebitda > 0:
-                net_debt = result.get("ibd", 0) - result.get("cash", 0)
-                ev = mkt_cap + net_debt
+        if result.get("oper_profit") is not None and cf_row is not None:
+            fin_exp = c._safe_float(inc_row.get("finance_exp"))
+            da = depreciation(cf_row)
+            ebitda = (result["oper_profit"] + fin_exp + da) / 1e6 if fin_exp is not None and da is not None else None
+            result["ebitda_basis"] = "营业利润+带符号财务费用+D&A（非标准EBITDA）"
+            if ebitda is not None and ebitda > 0 and all(result.get(key) is not None for key in ("ibd", "cash", "minority_equity")):
+                net_debt = result["ibd"] - result["cash"]
+                ev = mkt_cap + net_debt + result["minority_equity"]
                 result["ebitda"] = ebitda
                 result["ev"] = ev
                 result["ev_ebitda"] = ev / ebitda
                 result["net_debt_ebitda"] = net_debt / ebitda
 
         np_parent = result.get("np_parent")
-        if np_parent is not None and np_parent > 0:
-            net_cash = result.get("cash", 0) - result.get("ibd", 0)
+        if np_parent is not None and np_parent > 0 and result.get("cash") is not None and result.get("ibd") is not None:
+            net_cash = result["cash"] - result["ibd"]
             result["cash_adj_pe"] = (mkt_cap - net_cash) / (np_parent / 1e6)
         return result
 
@@ -652,17 +680,14 @@ class AKShareScreener:
 
         bs_row = self._latest_annual_row("balance_sheet")
         if bs_row is not None and total_shares > 0:
-            cash = c._safe_float(bs_row.get("money_cap")) or 0
-            trad = c._safe_float(bs_row.get("trad_asset")) or 0
-            ibd = 0.0
-            for col in ("st_borr", "lt_borr", "bond_payable", "non_cur_liab_due_1y"):
-                v = c._safe_float(bs_row.get(col))
-                if v:
-                    ibd += v
-            baselines.append(("net_liquid_assets", (cash + trad - ibd) / total_shares))
-
-            equity = c._safe_float(bs_row.get("total_hldr_eqy_exc_min_int")) or 0
-            baselines.append(("bvps", equity / total_shares))
+            cash = c._safe_float(bs_row.get("money_cap"))
+            trad = c._safe_float(bs_row.get("trad_asset"))
+            ibd = debt(bs_row)
+            if cash is not None and trad is not None and ibd is not None:
+                baselines.append(("net_liquid_assets", (cash + trad - ibd) / total_shares))
+            equity = c._safe_float(bs_row.get("total_hldr_eqy_exc_min_int"))
+            if equity is not None:
+                baselines.append(("bvps", equity / total_shares))
 
         weekly = c._store.get("weekly_prices")
         if weekly is not None and not weekly.empty:
@@ -673,13 +698,9 @@ class AKShareScreener:
         rf = self._get_rf()
         divs = c._store.get("dividends")
         if divs is not None and not divs.empty and rf is not None:
-            annual_dps: dict[str, float] = {}
-            for _, r in divs.iterrows():
-                y = str(r.get("end_date", ""))[:4]
-                dps = c._safe_float(r.get("cash_div_tax")) or 0
-                annual_dps[y] = annual_dps.get(y, 0) + dps
-            recent = sorted(annual_dps.values(), reverse=True)[:3]
-            if recent:
+            complete = annual_dividends(c._store.get("dividends_all", divs), c._store.get("as_of"))
+            recent = [r["dps"] for r in complete[:3]]
+            if len(recent) == 3:
                 avg_dps = sum(recent) / len(recent)
                 discount = max(rf / 100, 0.03)
                 baselines.append(("dividend_implied", avg_dps / discount))
@@ -691,11 +712,12 @@ class AKShareScreener:
                 o, cc = c._safe_float(r.get("n_cashflow_act")), c._safe_float(r.get("c_pay_acq_const_fiolta"))
                 if o is not None and cc is not None:
                     fcf_list.append(o - abs(cc))
-            if fcf_list and min(fcf_list) > 0:
+            if len(fcf_list) >= 3 and min(fcf_list) > 0:
                 baselines.append(("pessimistic_fcf", min(fcf_list) / (rf / 100) / total_shares))
 
+        baselines = [(name, value) for name, value in baselines if value > 0]
         result["baselines"] = baselines
-        if baselines:
+        if len(baselines) >= 3:
             composite = sum(v for _, v in baselines) / len(baselines)
             result["composite_baseline"] = composite
             result["premium"] = (close / composite - 1) * 100 if composite > 0 else None
@@ -718,11 +740,14 @@ class AKShareScreener:
             "ts_code": ts_code, "name": row.get("name", ""),
             "industry": row.get("industry", ""), "channel": channel,
             "close": close, "total_mv": total_mv_wan,
-            "pe_ttm": row.get("pe_ttm"), "pb": row.get("pb"),
+            "pe_static": row.get("pe_static", row.get("pe_ttm")), "pb": row.get("pb"),
             "dv_ttm": row.get("dv_ttm"),
+            "audit_status": "未核实（不等于通过）", "data_status": "候选，非买入建议",
+            "shares_basis": row.get("shares_basis", "未核实"),
         }
 
         passed, reason = self._check_hard_vetoes(ts_code)
+        result.update(getattr(self, "_veto_checks", {}))
         if not passed:
             result["veto"] = reason
             return None
@@ -738,6 +763,7 @@ class AKShareScreener:
         f2 = self._extract_factor2_metrics(total_mv_wan)
         result.update({"M": f2.get("M"), "R": f2.get("R"), "II": f2.get("II"),
                        "Rf": f2.get("Rf"), "R_vs_II": f2.get("R_vs_II")})
+        result.update({k: f2.get(k) for k in ("AA_proxy", "R_proxy", "R_basis")})
 
         f4 = self._extract_factor4_metrics(total_mv_wan)
         result.update({k: f4.get(k) for k in (
@@ -760,10 +786,13 @@ class AKShareScreener:
         df = df.copy()
 
         for col in ("roe_waa", "fcf_yield", "R"):
-            df[f"{col}_pctile"] = (df[col].rank(pct=True, na_option="bottom")
-                                   if col in df.columns else 0.0)
+            source = "roe_metric" if col == "roe_waa" and "roe_metric" in df else col
+            df[f"{col}_pctile"] = (pd.to_numeric(df[source], errors="coerce").replace([float("inf"), -float("inf")], float("nan"))
+                                   .rank(pct=True, na_option="keep").fillna(0)
+                                   if source in df.columns else 0.0)
         for col in ("ev_ebitda", "floor_premium"):
-            df[f"{col}_pctile"] = (1.0 - df[col].rank(pct=True, na_option="top")
+            df[f"{col}_pctile"] = (pd.to_numeric(df[col], errors="coerce").replace([float("inf"), -float("inf")], float("nan"))
+                                   .rank(pct=True, ascending=False, na_option="keep").fillna(0)
                                    if col in df.columns else 0.0)
 
         df["composite_score"] = (
@@ -784,6 +813,9 @@ class AKShareScreener:
         print("=== Tier 1: Bulk screening (AKShare) ===")
         bulk_df = self._tier1_bulk_data()
         print(f"  Universe: {len(bulk_df)} stocks")
+        for diagnostic in self.diagnostics:
+            if diagnostic["missing"]:
+                print(f"  ⚠️ {diagnostic['field']} missing: {diagnostic['missing']}/{diagnostic['total']} (not assumed zero/passed)")
 
         filtered = self._tier1_filter(bulk_df)
         n_main = len(filtered[filtered["channel"] == "main"]) if not filtered.empty else 0
@@ -839,7 +871,8 @@ class AKShareScreener:
     def export_html(self, df: pd.DataFrame, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         cols = ["ts_code", "name", "industry", "channel", "close",
-                "pe_ttm", "pb", "dv_ttm", "roe_waa", "M", "R", "R_vs_II",
+                "pe_static", "pb", "dv_ttm", "roe_metric", "roe_basis", "M", "R", "R_vs_II",
+                "data_status", "audit_status", "pledge_status", "shares_basis",
                 "ev_ebitda", "fcf_yield", "cash_adj_pe", "goodwill_ratio",
                 "floor_baseline", "floor_premium", "composite_score"]
         show = [c for c in cols if c in df.columns]
@@ -889,7 +922,8 @@ def main() -> int:
     screener = AKShareScreener(cfg)
     if args.cache_refresh:
         screener.cache.clear()
-        print("✓ screener cache cleared")
+        screener.client._cache.clear()
+        print("✓ screener and collector caches cleared")
 
     df = screener.run(tier1_only=args.tier1_only, tier2_limit=args.tier2_limit)
     if df.empty:
@@ -903,7 +937,6 @@ def main() -> int:
         screener.export_html(df, args.html)
     if not args.csv and not args.html and not args.tier1_only:
         screener.export_csv(df, f"{default_base}.csv")
-        screener.export_html(df, f"{default_base}.html")
     return 0
 
 

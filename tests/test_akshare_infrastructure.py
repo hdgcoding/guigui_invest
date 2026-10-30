@@ -30,6 +30,7 @@ def _dividend_df():
         "stk_div": [0, 0, 0, 0],
         "base_share": [632536.5, 632536.5, 636590.0, 636610.0],
         "div_proc": ["实施", "实施", "实施", "实施"],
+        "ex_date": ["2026-06-05", "2025-12-17", "2025-06-06", "2024-06-06"],
     })
 
 
@@ -109,6 +110,7 @@ class TestPayoutByYear:
         """中期(0930) + 末期(1231) 同属 FY2025，payout 应合并计算。"""
         client._store["income"] = _income_df()
         client._store["dividends"] = _dividend_df()
+        client._store["as_of"] = "2026-10-30"
 
         payout = client._get_payout_by_year()
         # FY2025: (0.9 + 0.48) 元/股 × 632536.5 万股 vs 归母净利 11565 百万

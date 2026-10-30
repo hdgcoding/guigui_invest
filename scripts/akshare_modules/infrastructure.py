@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import os
 import time
+import math
 
 import pandas as pd
 
@@ -91,12 +92,13 @@ class InfrastructureMixin:
 
         cache_key = key or endpoint
         ttl = CACHE_TTL_HOURS[category] * 3600
-        cached = self._cache.get(cache_key, ttl)
+        force_market = getattr(self, "_refresh_market", False) and category == "market"
+        cached = None if force_market else self._cache.get(cache_key, ttl)
         if cached is not None:
             return cached
 
         df = self._fetch_with_retry(fetch)
-        if df is not None:
+        if df is not None and not df.empty:
             self._cache.put(cache_key, df)
         return df if df is not None else pd.DataFrame()
 
@@ -111,7 +113,7 @@ class InfrastructureMixin:
         last_err = None
         direct_mode = False
         for attempt in range(retries + 1):
-            rate_limit(lambda: None)
+            rate_limit(lambda: None)()
             restore = None
             try:
                 if direct_mode:
@@ -209,7 +211,7 @@ class InfrastructureMixin:
             return None
         try:
             f = float(val)
-            return None if f != f else f  # NaN check
+            return f if math.isfinite(f) else None
         except (TypeError, ValueError):
             return None
 
@@ -248,22 +250,14 @@ class InfrastructureMixin:
             div_proc     "实施" for implemented
         payout(FY) = Σ(dps × base_share × 1e4) / n_income_attr_p(FY) × 100
         """
-        div_df = self._store.get("dividends")
+        from financial_contracts import annual_dividends
+        div_df = self._store.get("dividends_all", self._store.get("dividends"))
         income_df = self._get_annual_df("income")
         if div_df is None or div_df.empty or income_df.empty:
             return {}
 
-        div_lookup: dict[str, float] = {}
-        for _, r in div_df.iterrows():
-            if str(r.get("div_proc", "")) != "实施":
-                continue
-            year = str(r.get("end_date", ""))[:4]
-            if not year:
-                continue
-            dps = self._safe_float(r.get("cash_div_tax")) or 0
-            base_share = self._safe_float(r.get("base_share")) or 0
-            payment = dps * base_share * 10000  # 元
-            div_lookup[year] = div_lookup.get(year, 0) + payment
+        div_lookup = {r["year"]: r["total_yuan"] for r in
+                      annual_dividends(div_df, self._store.get("as_of"))}
 
         np_lookup: dict[str, float | None] = {}
         for _, r in income_df.iterrows():
@@ -273,6 +267,6 @@ class InfrastructureMixin:
         result: dict[str, float] = {}
         for year, div_total in div_lookup.items():
             np_val = np_lookup.get(year)
-            if div_total and np_val and np_val > 0:
+            if div_total is not None and np_val and np_val > 0:
                 result[year] = div_total / np_val * 100
         return result

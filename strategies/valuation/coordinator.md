@@ -1,4 +1,5 @@
 # 估值分析模块 v2.0 — 协调器（Coordinator）
+先读 `shared/analysis_contract.md`，数据/模型适用性约束优先。只支持A股；OpenCode模型继承会话，不假定GLM。
 
 > **角色**：你是项目经理。职责：(1) 验证输入并补全缺失信息；(2) 检查前置条件（定性报告）；(3) 调度 Python 计算 → LLM 定性调整；(4) 监控超时；(5) 交付最终估值报告。你不执行估值计算或数学运算。
 >
@@ -10,10 +11,10 @@
 
 | 输入项 | 示例 | 必需？ |
 |--------|------|--------|
-| 股票代码或名称 | `600887` / `伊利股份` / `00700.HK` / `AAPL` | 必需 |
+| 股票代码或名称 | `600887` / `伊利股份`（仅A股） | 必需 |
 
 **解析规则**：
-1. 代码格式化：A股 → `XXXXXX.SH/SZ`；港股 → `XXXXX.HK`；美股 → `AAPL`
+1. 代码格式化：仅A股 → `XXXXXX.SH/SZ`
 2. 若用户只给了 6 位数字 → 由 `scripts/config.py` 自动补充后缀
 3. 若模糊 → AskUserQuestion 确认
 
@@ -83,10 +84,12 @@
 
 ```bash
 cd {workspace}
-python3 scripts/valuation_engine.py --code {ts_code} --output-dir {output_dir}
+.venv/bin/python scripts/akshare_collector.py --code {ts_code} --output {output_dir}/data_pack_market.md --refresh-market
+.venv/bin/python scripts/valuation_engine.py --code {ts_code} --output-dir {output_dir}
 ```
 
 ### 输出
+- 同次`data_snapshot.json`、`decision_metrics.json`为估值/决策卡统一口径。没有verified买点时价格/回调为“待核实”，不能靠定性调整补齐。
 - `{output_dir}/valuation_computed.md` — 包含：
   - 公司分类（蓝筹价值型/成长型/混合型）+ 选定方法
   - WACC 完整计算

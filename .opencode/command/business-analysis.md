@@ -14,6 +14,7 @@ Run a standalone Business Model & Moat Qualitative Analysis (商业模式与护�
 ## Execution Instructions
 
 Read shared/qualitative/coordinator.md for the full pipeline specification, then execute each step:
+先读 `shared/analysis_contract.md`，其数据、PDF与降级交付约束优先。纯定性未估值时，决策卡买价/回调写“未估值”，禁止临时推算。
 
 ### Step 1: Data Collection
 

@@ -12,6 +12,7 @@ sections as the original Tushare-based framework (A-share only):
 from __future__ import annotations
 
 import pandas as pd
+from financial_contracts import yuan
 
 from config import split_code
 from format_utils import format_number, format_table, format_header
@@ -32,7 +33,7 @@ class FinancialsMixin:
     # ------------------------------------------------------------------
 
     def _fetch_sina_statement(self, ts_code: str, symbol: str,
-                              col_map: dict) -> pd.DataFrame:
+                              col_map: dict, scope: str = "consolidated") -> pd.DataFrame:
         """Fetch a Sina financial statement and normalize columns.
 
         Returns DataFrame with internal column names plus end_date (YYYYMMDD),
@@ -50,12 +51,21 @@ class FinancialsMixin:
         if df is None or df.empty:
             return pd.DataFrame()
 
-        # Some Sina responses include parent-company rows; keep consolidated
-        for meta_col in ("类型",):
-            if meta_col in df.columns:
-                types = df[meta_col].astype(str)
-                if (types == "合并报表").any():
-                    df = df[types == "合并报表"]
+        df = df.copy()
+        if "类型" in df:
+            types = df["类型"].astype(str)
+            consolidated = types.str.contains("合并", na=False)
+            parent = types.str.contains("母公司", na=False)
+            if scope == "parent":
+                df = df[parent]
+            elif consolidated.any():
+                df = df[consolidated]
+            else:
+                df = df[~parent]
+        elif scope == "parent":
+            return pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame()
 
         # Build normalized frame
         out = pd.DataFrame()
@@ -67,11 +77,13 @@ class FinancialsMixin:
                 out[internal] = pd.to_numeric(df[cn], errors="coerce")
             else:
                 out[internal] = pd.NA
-        # Keep raw values numeric (they are already in yuan)
-        for c in out.columns:
-            if c != "end_date":
-                out[c] = pd.to_numeric(out[c], errors="coerce")
-
+        for target, source in (("ann_date", "公告日期"), ("updated_at", "更新日期")):
+            if source in df:
+                out[target] = pd.to_datetime(df[source].astype(str), errors="coerce").dt.strftime("%Y-%m-%d")
+        out["statement_scope"] = scope
+        out["source"] = "AKShare/Sina"
+        sort_cols = [c for c in ("end_date", "ann_date", "updated_at") if c in out]
+        out = out.sort_values(sort_cols, ascending=False, na_position="last")
         out = out.drop_duplicates(subset=["end_date"])
         out = out.sort_values("end_date", ascending=False).reset_index(drop=True)
         return out
@@ -94,8 +106,13 @@ class FinancialsMixin:
         total_mv_wan = val.get("total_mv_wan")   # 万元
 
         total_share_wan = None
-        if total_mv_wan and close:
+        synchronized = val.get("date") == price_df.get("date") and val.get("date") is not None
+        if not synchronized:
+            pe_ttm, pb = None, None
+        if total_mv_wan and close and synchronized:
             total_share_wan = total_mv_wan * 1e4 / close / 1e4  # 万股
+        elif total_mv_wan:
+            total_mv_wan = None
 
         # Store for downstream (valuation engine / derived metrics)
         self._store["basic_info"] = pd.DataFrame([{
@@ -106,8 +123,11 @@ class FinancialsMixin:
             "pe_ttm": pe_ttm,
             "pb": pb,
             "total_mv": total_mv_wan,          # 万元 (Tushare convention)
-            "circ_mv": total_mv_wan,
+            "circ_mv": None,  # total market cap is not circulating market cap
             "total_share": total_share_wan,    # 万股
+            "shares_basis": "同日市值/未复权价格推算，非实测总股本" if total_share_wan else "未核实",
+            "valuation_date": val.get("date"),
+            "price_basis": "unadjusted",
             "list_date": list_date,
         }])
 
@@ -122,10 +142,12 @@ class FinancialsMixin:
             ["PB", f"{pb:.2f}" if pb else "—"],
             ["总市值 (万元)", format_number(total_mv_wan, divider=1)],
             ["总股本 (万股)", format_number(total_share_wan, divider=1)],
+            ["行情日期 / 估值日期", f"{price_df.get('date', '—')} / {val.get('date', '—')}"],
+            ["股本口径", "同日市值÷未复权收盘价（推算）" if total_share_wan else "未核实；禁止计算每股估值"],
         ]
         lines.append(format_table(["项目", "内容"], rows, alignments=["l", "r"]))
         lines.append("")
-        lines.append("*来源: AKShare (百度估值/东财行情), PE/PB 为 TTM 口径*")
+        lines.append("*来源: AKShare 新浪未复权收盘价/百度估值；PE 为TTM，PB为账面口径；日期不同则市值/股本停用。*")
         return "\n".join(lines)
 
     def _fetch_name_and_list_date(self, ts_code: str) -> tuple[str | None, str | None]:
@@ -178,7 +200,7 @@ class FinancialsMixin:
         return name, list_date
 
     def _fetch_daily(self, num: str) -> pd.DataFrame:
-        """Full daily OHLCV (qfq) from Sina, normalized + cached.
+        """Full unadjusted daily OHLCV from Sina, normalized + cached.
 
         Returns trade_date/open/high/low/close/vol/amount (vol in 股).
         """
@@ -186,9 +208,9 @@ class FinancialsMixin:
             import akshare as ak
             # Determine prefix from code: 6 -> sh, else sz
             pfx = "sh" if num.startswith("6") else "sz"
-            return ak.stock_zh_a_daily(symbol=f"{pfx}{num}", adjust="qfq")
+            return ak.stock_zh_a_daily(symbol=f"{pfx}{num}", adjust="")
 
-        df = self._cached_call("daily_hist", _fetch, key=f"daily_hist:{num}")
+        df = self._cached_call("daily_raw", _fetch, key=f"daily_raw:{num}")
         if df is None or df.empty:
             return pd.DataFrame()
 
@@ -212,29 +234,24 @@ class FinancialsMixin:
 
     def _fetch_valuation(self, num: str) -> dict:
         """Latest PE-TTM / PB / total market cap from Baidu valuation."""
-        def _fetch():
-            import akshare as ak
-            pe = ak.stock_zh_valuation_baidu(symbol=num, indicator="市盈率(TTM)", period="近一年")
-            pb = ak.stock_zh_valuation_baidu(symbol=num, indicator="市净率", period="近一年")
-            mv = ak.stock_zh_valuation_baidu(symbol=num, indicator="总市值", period="近一年")
-            return (pe, pb, mv)
-
-        try:
-            pe_df, pb_df, mv_df = _fetch()
-        except Exception as e:
-            print(f"  ⚠️ 百度估值接口失败: {e}")
+        import akshare as ak
+        series = []
+        for indicator in ("市盈率(TTM)", "市净率", "总市值"):
+            def _fetch(ind=indicator):
+                return ak.stock_zh_valuation_baidu(symbol=num, indicator=ind, period="近一年")
+            df = self._cached_call("valuation", _fetch, key=f"valuation:{num}:{indicator}")
+            if df is None or df.empty or not {"date", "value"}.issubset(df.columns):
+                return {}
+            dates = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y%m%d")
+            series.append(pd.Series(pd.to_numeric(df["value"], errors="coerce").values, index=dates).groupby(level=0).last())
+        common = set(series[0].index) & set(series[1].index) & set(series[2].index)
+        common = [d for d in common if d <= pd.Timestamp.now().strftime("%Y%m%d")]
+        if not common:
             return {}
-
-        def _latest(df):
-            if df is None or df.empty:
-                return None
-            df = df.sort_values("date", ascending=False)
-            return self._safe_float(df.iloc[0]["value"])
-
-        pe = _latest(pe_df)
-        pb = _latest(pb_df)
-        mv_yi = _latest(mv_df)  # 亿元
+        date = max(common)
+        pe, pb, mv_yi = [self._safe_float(s.loc[date]) for s in series]
         return {
+            "date": date,
             "pe_ttm": pe,
             "pb": pb,
             "total_mv_wan": mv_yi * 10000 if mv_yi else None,  # 万元
@@ -266,7 +283,7 @@ class FinancialsMixin:
         low_date = str(w.loc[w["low"].idxmin(), "trade_date"])
         avg_vol = float(w["vol"].mean())
 
-        lines.append("*来源: AKShare 新浪日线 (前复权) 重采样周线*\n")
+        lines.append("*来源: AKShare 新浪未复权日线重采样；历史价格不代表含分红总回报*\n")
         lines.append(format_table(
             ["指标", "数值"],
             [
@@ -336,12 +353,12 @@ class FinancialsMixin:
         lines.append(format_table(headers, rows, alignments=["l"] + ["r"] * len(years)))
         lines.append("")
         lines.append("*单位: 百万元 (原始数据 / 1,000,000), EPS为元/股; 来源: AKShare 新浪财经*")
+        lines.extend(self._statement_metadata(df))
         return "\n".join(lines)
 
     def get_income_parent(self, ts_code: str) -> str:
         """Section 3P: parent-company income (degraded — AKShare 无母公司报表)."""
-        return (format_header(2, "3P. 母公司利润表")
-                + "\n\n数据缺失 (AKShare 新浪接口仅提供合并报表；如需母公司口径请阅读年报 PDF 附注补充)\n")
+        return self._parent_statement(ts_code, "利润表", SINA_INCOME_MAP, "3P", "income_parent")
 
     # ------------------------------------------------------------------
     # §4 / §4P — Balance sheet
@@ -401,12 +418,35 @@ class FinancialsMixin:
         lines.append(format_table(headers, rows, alignments=["l"] + ["r"] * len(years)))
         lines.append("")
         lines.append("*单位: 百万元; 来源: AKShare 新浪财经*")
+        lines.extend(self._statement_metadata(df))
         return "\n".join(lines)
 
     def get_balance_sheet_parent(self, ts_code: str) -> str:
         """Section 4P: parent-company balance sheet (degraded)."""
-        return (format_header(2, "4P. 母公司资产负债表")
-                + "\n\n数据缺失 (AKShare 新浪接口仅提供合并报表；如需母公司口径请阅读年报 PDF 附注补充)\n")
+        return self._parent_statement(ts_code, "资产负债表", SINA_BALANCE_MAP, "4P", "balance_sheet_parent")
+
+    @staticmethod
+    def _statement_metadata(df):
+        cols = [c for c in ("end_date", "ann_date", "updated_at", "statement_scope", "source", "da_source") if c in df]
+        return ["", "*期间/公告版本（不同公告日期不代表已完成重述对齐）：*",
+                format_table(cols, [[str(r.get(c, "—")) for c in cols] for _, r in df.iterrows()])]
+
+    def _parent_statement(self, ts_code, symbol, mapping, section, key):
+        raw = self._fetch_sina_statement(ts_code, symbol, mapping, scope="parent")
+        title = format_header(2, f"{section}. 母公司{symbol}")
+        if raw.empty:
+            return title + "\n\n数据缺失（数据源未提供母公司口径；须由年报PDF补充，禁止使用合并值替代）\n"
+        df, labels = self._prepare_display_periods(raw)
+        self._store[key] = df
+        return self._render_parent_data(section, symbol, mapping, key)
+
+    def _render_parent_data(self, section, symbol, mapping, key):
+        df, labels = self._prepare_display_periods(self._store[key])
+        rows = [[label] + [format_number(r.get(field), divider=1 if "eps" in field else 1e6)
+                          for _, r in df.iterrows()] for field, label in mapping.items()]
+        sources = "; ".join(str(r.get("source", "")) + " " + str(r.get("source_locator", "")) for _, r in df.iterrows())
+        return (format_header(2, f"{section}. 母公司{symbol}") + "\n\n" +
+                format_table(["项目(百万元，EPS元/股)"] + labels, rows) + f"\n\n*来源: {sources}*\n")
 
     # ------------------------------------------------------------------
     # §5 — Cash flow
@@ -421,6 +461,7 @@ class FinancialsMixin:
             lines.append("数据缺失\n")
             return "\n".join(lines)
 
+        raw = self._supplement_da(ts_code, raw)
         df, years = self._prepare_display_periods(raw)
         self._store["cashflow"] = df
         self._store["cashflow_years"] = years
@@ -441,6 +482,9 @@ class FinancialsMixin:
             ("  分配股利/利息支付的现金", "c_pay_dist_dpcp_int_exp"),
             ("支付给职工现金", "c_pay_to_staff"),
             ("支付的各项税费", "c_paid_for_taxes"),
+            ("固定资产折旧", "depr_fa_coga_dpba"),
+            ("无形资产摊销", "amort_intang_assets"),
+            ("长期待摊费用摊销", "lt_amort_deferred_exp"),
         ]
         for label, col in simple_fields:
             row = [label]
@@ -462,8 +506,55 @@ class FinancialsMixin:
         lines.append(format_table(headers, rows, alignments=["l"] + ["r"] * len(years)))
         lines.append("")
         lines.append("*单位: 百万元; FCF = OCF - |Capex|; 来源: AKShare 新浪财经*")
-        lines.append("*注: 新浪接口不含折旧摊销附表，D&A 相关衍生指标降级*")
+        lines.append("*D&A补充: 东财年度现金流附表，失败回退同花顺；同类折旧字段取一个，不重复加总。缺项保持未知。*")
+        lines.extend(self._statement_metadata(df))
         return "\n".join(lines)
+
+    def _supplement_da(self, ts_code, raw):
+        """Supplement only matching annual periods, preserving source provenance."""
+        from financial_contracts import DA_FIELDS
+        num, prefix = split_code(ts_code)
+        import akshare as ak
+        em = self._cached_call("cashflow_da_em", lambda: ak.stock_cash_flow_sheet_by_yearly_em(
+            symbol=f"{prefix.upper()}{num}"), key=f"cashflow_da_em:{num}")
+        sources = [(em, "REPORT_DATE", "Eastmoney", {
+            DA_FIELDS[0]: ("FA_IR_DEPR", "OILGAS_BIOLOGY_DEPR", "IR_DEPR"),
+            DA_FIELDS[1]: ("IA_AMORTIZE",), DA_FIELDS[2]: ("LPE_AMORTIZE",)})]
+        out = raw.copy()
+        if "da_source" not in out:
+            out["da_source"] = pd.Series(None, index=out.index, dtype="object")
+        for field in DA_FIELDS:
+            if field not in out:
+                out[field] = float("nan")
+        def apply(frame, date_col, source, mapping):
+            if frame is None or frame.empty or date_col not in frame:
+                return
+            frame = frame.copy()
+            frame["_date"] = pd.to_datetime(frame[date_col], errors="coerce").dt.strftime("%Y%m%d")
+            frame = frame.drop_duplicates("_date").set_index("_date")
+            for idx, row in out.iterrows():
+                period = str(row["end_date"])
+                if period not in frame.index or not period.endswith("1231"):
+                    continue
+                for target, candidates in mapping.items():
+                    if pd.notna(out.at[idx, target]):
+                        continue
+                    for candidate in candidates:
+                        value = yuan(frame.loc[period].get(candidate))
+                        if value is not None:
+                            out.at[idx, target] = value
+                            out.at[idx, "da_source"] = source
+                            break
+        for source in sources:
+            apply(*source)
+        annual = out[out["end_date"].str.endswith("1231")].head(5)
+        if annual[list(DA_FIELDS)].isna().any().any():
+            ths = self._cached_call("cashflow_da_ths", lambda: ak.stock_financial_cash_ths(
+                symbol=num, indicator="按年度"), key=f"cashflow_da_ths:{num}")
+            apply(ths, "报告期", "THS", {
+                DA_FIELDS[0]: ("固定资产折旧、油气资产折耗、生产性生物资产折旧",),
+                DA_FIELDS[1]: ("无形资产摊销",), DA_FIELDS[2]: ("长期待摊费用摊销",)})
+        return out
 
     # ------------------------------------------------------------------
     # §6 — Dividends
@@ -479,7 +570,7 @@ class FinancialsMixin:
             import akshare as ak
             return ak.stock_fhps_detail_em(symbol=num)
 
-        df = self._fetch_with_retry(_fetch)
+        df = self._cached_call("dividend", _fetch, key=f"dividend:{num}")
         if df is None or df.empty:
             return pd.DataFrame()
 
@@ -489,23 +580,23 @@ class FinancialsMixin:
             if not report_period or report_period == "NaT":
                 continue
             end_date = pd.Timestamp(report_period).strftime("%Y%m%d")
-            cash_per_10 = self._safe_float(r.get("现金分红-现金分红比例")) or 0
-            stk_per_10 = self._safe_float(r.get("送转股份-送股比例")) or 0
-            total_shares = self._safe_float(r.get("总股本")) or 0
+            cash_per_10 = self._safe_float(r.get("现金分红-现金分红比例"))
+            stk_per_10 = self._safe_float(r.get("送转股份-送股比例"))
+            total_shares = self._safe_float(r.get("总股本"))
             proc = str(r.get("方案进度", ""))
             recs.append({
                 "end_date": end_date,
                 # 现金分红比例为每10股派息(含税, 元) → 转为每股(元)
-                "cash_div_tax": cash_per_10 / 10 if cash_per_10 else 0,
-                "stk_div": stk_per_10 / 10 if stk_per_10 else 0,
-                "base_share": total_shares / 1e4 if total_shares else 0,  # 万股
+                "cash_div_tax": cash_per_10 / 10 if cash_per_10 is not None else None,
+                "stk_div": stk_per_10 / 10 if stk_per_10 is not None else None,
+                "base_share": total_shares / 1e4 if total_shares is not None else None,  # 万股
                 "div_proc": "实施" if "实施" in proc else proc,
                 "ex_date": str(r.get("除权除息日", "")),
                 "plan": str(r.get("现金分红-现金分红比例描述", "")),
             })
         if not recs:
             return pd.DataFrame()
-        return pd.DataFrame(recs).sort_values("end_date", ascending=False).reset_index(drop=True)
+        return pd.DataFrame(recs).drop_duplicates().sort_values("end_date", ascending=False).reset_index(drop=True)
 
     def get_dividends(self, ts_code: str) -> str:
         """Section 6: dividend history from em 分红送配详情."""
@@ -534,19 +625,26 @@ class FinancialsMixin:
             lines.append("暂无已实施分红\n")
             return "\n".join(lines)
 
-        headers = ["报告期", "每股现金分红(税前,元)", "每股送股", "除权除息日", "方案"]
+        headers = ["报告期", "每股现金分红(税前,元)", "每股送股", "除权除息日", "方案", "分红总额(百万元)"]
         rows = []
         for _, r in impl.iterrows():
+            cash = self._safe_float(r.get("cash_div_tax"))
+            stock = self._safe_float(r.get("stk_div"))
+            shares = self._safe_float(r.get("base_share"))
             rows.append([
                 str(r["end_date"]),
-                f"{r['cash_div_tax']:.4f}" if r["cash_div_tax"] else "—",
-                f"{r['stk_div']:.2f}" if r["stk_div"] else "—",
+                f"{cash:.4f}" if cash is not None else "—",
+                f"{stock:.2f}" if stock is not None else "—",
                 r["ex_date"][:10] if r["ex_date"] else "—",
                 r.get("plan", "—"),
+                format_number(cash * shares * 1e4) if cash is not None and shares is not None and shares > 0 else "—",
             ])
-        lines.append(format_table(headers, rows, alignments=["l", "r", "r", "l", "l"]))
+        lines.append(format_table(headers, rows, alignments=["l", "r", "r", "l", "l", "r"]))
         lines.append("")
         lines.append("*来源: AKShare 东财分红送配; 中期+末期分红同属一个报告年度*")
+        from financial_contracts import annual_dividends
+        complete = annual_dividends(all_div, self._store.get("as_of"))
+        lines.append("*完整分红年度: " + (", ".join(r["year"] for r in complete) or "未核实") + "；仅完整年度可用于年度股息率/M/DDM。*")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -590,6 +688,7 @@ class FinancialsMixin:
             return "\n".join(lines)
 
         self._store["weekly_prices"] = df
+        self._store["price_basis"] = "unadjusted"
 
         high_10y = df["high"].max()
         low_10y = df["low"].min()
@@ -629,7 +728,7 @@ class FinancialsMixin:
             alignments=["l", "r", "r", "r", "r"],
         ))
         lines.append("")
-        lines.append("*来源: AKShare 东财历史行情 (周线, 前复权)*")
+        lines.append("*来源: AKShare 新浪未复权日线重采样周线；不含分红再投资。*")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -640,9 +739,9 @@ class FinancialsMixin:
         """Normalized sina fina indicators (end_date + internal cols, desc)."""
         def _fetch():
             import akshare as ak
-            return ak.stock_financial_analysis_indicator(symbol=num)
+            return ak.stock_financial_analysis_indicator(symbol=num, start_year=str(pd.Timestamp.now().year - 6))
 
-        df = self._fetch_with_retry(_fetch)
+        df = self._cached_call("fina_indicator", _fetch, key=f"fina_indicator:{num}")
         if df is None or df.empty or "日期" not in df.columns:
             return pd.DataFrame()
 
@@ -657,7 +756,7 @@ class FinancialsMixin:
     def get_fina_indicators(self, ts_code: str) -> str:
         """Section 12: key financial indicators (新浪财务指标)."""
         num, _ = split_code(ts_code)
-        out = self._fetch_fina_indicators_df(num)
+        out = self._merge_derived_indicators(self._fetch_fina_indicators_df(num))
         lines = [format_header(2, "12. 关键财务指标"), ""]
 
         if out.empty:
@@ -707,5 +806,34 @@ class FinancialsMixin:
 
         lines.append(format_table(headers, rows, alignments=["l"] + ["r"] * len(years)))
         lines.append("")
-        lines.append("*来源: AKShare 新浪财务指标; ROE 为年报口径*")
+        lines.append("*来源: AKShare 新浪；缺项按同报告期三表推导。摊薄ROE=归母净利润/期末归母权益；不冒充加权ROE。中期为年初累计，非单季/非年化。*")
         return "\n".join(lines)
+
+    def _merge_derived_indicators(self, indicators):
+        records = []
+        income = self._store.get("income", pd.DataFrame())
+        balance = self._store.get("balance_sheet", pd.DataFrame())
+        bs = {str(r["end_date"]): r for _, r in balance.iterrows()}
+        for _, inc in income.iterrows():
+            period = str(inc["end_date"])
+            row = bs.get(period, {})
+            def ratio(a, b):
+                a, b = self._safe_float(a), self._safe_float(b)
+                return a / b * 100 if a is not None and b is not None and b > 0 else None
+            rev, cost = self._safe_float(inc.get("revenue")), self._safe_float(inc.get("oper_cost"))
+            records.append({"end_date": period,
+                "roe": ratio(inc.get("n_income_attr_p"), row.get("total_hldr_eqy_exc_min_int")),
+                "grossprofit_margin": (rev - cost) / rev * 100 if rev and cost is not None else None,
+                "netprofit_margin": ratio(inc.get("n_income"), rev),
+                "debt_to_assets": ratio(row.get("total_liab"), row.get("total_assets")),
+                "eps": self._safe_float(inc.get("basic_eps"))})
+        derived = pd.DataFrame(records)
+        if derived.empty:
+            return indicators
+        derived = derived.set_index("end_date")
+        if indicators is not None and not indicators.empty:
+            derived = indicators.set_index("end_date").combine_first(derived)
+        for col in SINA_FINA_INDICATOR_MAP:
+            if col not in derived:
+                derived[col] = float("nan")
+        return derived.reset_index().sort_values("end_date", ascending=False).reset_index(drop=True)

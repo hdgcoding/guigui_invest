@@ -116,7 +116,15 @@ def parse_sections(text: str) -> Dict[str, str]:
 
 def parse_matrix(block: str):
     """item×year table → (year_cols, {item: {year: float}})."""
-    rows = [r for r in _rows(block) if not _is_sep(r)]
+    # The collector appends a separate provenance table. Do not interpret its
+    # dates/source fields as another set of financial rows.
+    table = []
+    for line in block.splitlines():
+        if line.strip().startswith("|"):
+            table.append(line)
+        elif table:
+            break
+    rows = [r for r in _rows("\n".join(table)) if not _is_sep(r)]
     if len(rows) < 2:
         return [], {}
     cols = rows[0][1:]
@@ -138,6 +146,9 @@ def parse_kv(block: str) -> Dict[str, str]:
 
 
 def find_item(data: Dict[str, dict], *names: str) -> Optional[str]:
+    aliases = {"营业收入": ("营业总收入",), "总资产": ("资产总计",),
+               "归母所有者权益": ("归母股东权益",), "归母权益": ("归母股东权益",)}
+    names = tuple(alias for name in names for alias in (name,) + aliases.get(name, ()))
     for name in names:
         for k in data:
             if k.replace(" ", "").startswith(name):
@@ -296,11 +307,20 @@ def _dividends_by_year(block: str) -> Dict[str, float]:
         return {}
     header = rows[0]
     # locate 年度 col (0) and 总分红 col (contains 总分红)
-    div_idx = next((i for i, h in enumerate(header) if "总分红" in h), len(header) - 1)
+    div_idx = next((i for i, h in enumerate(header) if "总分红" in h or "分红总额" in h), None)
+    if div_idx is None:
+        return {}  # a DPS/plan description is not a dividend total
+    complete_match = re.search(r"完整分红年度:\s*([^；*]+)", block)
+    complete = set(re.findall(r"\d{4}", complete_match[1])) if complete_match else None
     agg: Dict[str, float] = {}
     for r in rows[1:]:
         yr = r[0].strip()
-        if not re.fullmatch(r"\d{4}", yr):
+        if not re.fullmatch(r"\d{4}(?:\d{4})?", yr):
+            continue
+        if len(yr) == 8 and complete is None:
+            continue  # a report period does not establish completed annual dividends
+        yr = yr[:4]
+        if complete is not None and yr not in complete:
             continue
         val = _num(r[div_idx] if div_idx < len(r) else None)
         if val is not None:

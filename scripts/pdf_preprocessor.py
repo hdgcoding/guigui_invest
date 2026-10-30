@@ -33,11 +33,11 @@ import pdfplumber
 
 # Display names for the 7 target sections (used by text exports)
 SECTION_NAMES: Dict[str, str] = {
-    "P2": "公司治理",
-    "P3": "会计政策",
-    "P4": "应收账款",
-    "P6": "合并报表",
-    "P13": "风险提示",
+    "P2": "受限资产",
+    "P3": "应收账款账龄",
+    "P4": "关联交易",
+    "P6": "或有负债与承诺",
+    "P13": "非经常性损益",
     "MDA": "管理层讨论与分析",
     "SUB": "主要子公司",
 }
@@ -736,6 +736,10 @@ def write_text_exports(pages_text: List[Tuple[int, str]],
     Returns list of files written.
     """
     written = []
+    if full_text_part_chars < 100:
+        raise ValueError("full_text_part_chars must be >= 100")
+    if full_text and not any(text and text.strip() for _, text in pages_text):
+        raise RuntimeError("PDF无可用文本（可能为扫描件）；需要OCR或WebSearch补充，不能声称已阅读年报")
 
     # --- Sections digest ---
     lines = [
@@ -743,10 +747,10 @@ def write_text_exports(pages_text: List[Tuple[int, str]],
         "",
         f"*提取时间: {metadata.get('extract_time', '')} · "
         f"共 {metadata.get('total_pages', 0)} 页 · "
-        f"命中 {metadata.get('sections_found', 0)}/{metadata.get('sections_total', 0)} 章节*",
+        f"命中 {metadata.get('sections_found', 0)}/{metadata.get('sections_total', 0)} 关键词类别（不是完整章节覆盖率）*",
         "",
         "> 本文件由 pdf_preprocessor.py 从年报 PDF 提取的**文本**，供 GLM 文本优先阅读。",
-        "> 章节上下文已按关键词定位截取；完整原文见 pdf_fulltext_part*.md（如已生成）。",
+        "> 章节上下文为关键词附近截取，并非完整章节。完整文本见同名前缀 _fulltext_part*.md（如已生成）。",
         "",
         "---",
         "",
@@ -770,44 +774,49 @@ def write_text_exports(pages_text: List[Tuple[int, str]],
     # --- Full text parts ---
     if full_text:
         base, _ext = os.path.splitext(text_output)
-        total_chars = sum(len(t) for _pn, t in pages_text)
-        n_parts = max(1, -(-total_chars // full_text_part_chars))
-        part_no = 1
-        buf: list[str] = []
-        buf_chars = 0
-        first_page: Optional[int] = None
-
-        def _flush(part_no: int, buf: list[str], first_page: Optional[int]) -> str:
-            path = f"{base}_fulltext_part{part_no}.md"
-            header = [
-                f"# 年报全文分片 {part_no}/{n_parts}",
-                "",
-                f"*源文件: {metadata.get('pdf_file', '')} · "
-                f"本片覆盖第 {first_page}-{last_page} 页*",
-                "",
-                "---",
-                "",
-            ]
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(header + buf))
-            return path
-
+        chunks = []
+        buf, page_numbers, size = [], [], 0
         for page_num, text in pages_text:
-            if not text:
+            if not text or not text.strip():
                 continue
-            if first_page is None:
-                first_page = page_num
-            piece = f"--- p.{page_num} ---\n{text}\n"
-            buf.append(piece)
-            buf_chars += len(piece)
-            if buf_chars >= full_text_part_chars:
-                last_page = page_num
-                written.append(_flush(part_no, buf, first_page))
-                part_no += 1
-                buf, buf_chars, first_page = [], 0, None
+            marker = f"--- p.{page_num} ---\n"
+            limit = full_text_part_chars - len(marker) - 1
+            for start in range(0, len(text), limit):
+                piece = marker + text[start:start + limit] + "\n"
+                if buf and size + len(piece) > full_text_part_chars:
+                    chunks.append((buf, page_numbers))
+                    buf, page_numbers, size = [], [], 0
+                buf.append(piece)
+                page_numbers.append(page_num)
+                size += len(piece)
         if buf:
-            last_page = pages_text[-1][0]
-            written.append(_flush(part_no, buf, first_page))
+            chunks.append((buf, page_numbers))
+        manifest = {"source": metadata.get("pdf_file"), "parts": [],
+                    "section_candidate_pages": metadata.get("section_candidate_pages", {}),
+                    "empty_pages": [pn for pn, text in pages_text if not text or not text.strip()],
+                    "coverage_note": "关键词上下文不是完整章节；扫描页需OCR；生成全文不等于Agent已逐页阅读"}
+        for part_no, (content, numbers) in enumerate(chunks, 1):
+            path = f"{base}_fulltext_part{part_no}.md"
+            header = (f"# 年报全文分片 {part_no}/{len(chunks)}\n\n"
+                      f"*源文件: {metadata.get('pdf_file', '')} · 本片覆盖第 {min(numbers)}-{max(numbers)} 页*\n\n---\n\n")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(header + "".join(content))
+            written.append(path)
+            manifest["parts"].append({"file": os.path.basename(path), "pages": sorted(set(numbers))})
+        manifest_path = f"{base}_manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        # Remove only our stale generated chunks, never arbitrary user files.
+        from pathlib import Path
+        parent = Path(base).parent
+        pattern = re.compile(re.escape(Path(base).name) + r"_fulltext_part(\d+)\.md$")
+        for candidate in parent.iterdir():
+            match = pattern.fullmatch(candidate.name)
+            if match and int(match[1]) > len(chunks) and candidate.is_file():
+                with candidate.open(encoding="utf-8") as stream:
+                    generated = stream.readline().startswith("# 年报全文分片 ")
+                if generated:
+                    candidate.unlink()
 
     return written
 
@@ -867,8 +876,11 @@ def run_pipeline(pdf_path: str, output_path: str, verbose: bool = False,
     pages_text = extract_all_pages(pdf_path, verbose=verbose)
     total_pages = len(pages_text)
 
-    if total_pages == 0:
-        raise RuntimeError("PDF has no extractable pages")
+    useful_pages = sum(bool(text and text.strip() and not is_garbled(text)) for _, text in pages_text)
+    if total_pages == 0 or useful_pages == 0:
+        raise RuntimeError("PDF无可用文本：可能是扫描件或乱码；需OCR/WebSearch补充，未完成年报阅读")
+    if useful_pages < total_pages:
+        print(f"  ⚠️ 仅 {useful_pages}/{total_pages} 页有可用文本；其余页需核对/OCR，不能声称全文已读")
 
     print(f"  Extracted {total_pages} pages")
 
@@ -904,6 +916,10 @@ def run_pipeline(pdf_path: str, output_path: str, verbose: bool = False,
     # Step 4: Write output
     print(f"[4/4] Writing output to {output_path}...")
     result = write_output(contexts, pdf_path, total_pages, output_path)
+    result["metadata"].update({"text_pages": useful_pages, "section_candidate_pages": section_pages,
+                               "coverage_status": "partial" if useful_pages < total_pages else "text_extracted_not_read"})
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
 
     # Optional: GLM-friendly text exports (PDF-first 文本优先模式)
     if text_output or full_text:

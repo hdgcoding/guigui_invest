@@ -17,12 +17,13 @@ Before executing, verify these files exist in output/{code}_{company}/:
 ## Execution Instructions
 
 Read strategies/valuation/coordinator.md for the full pipeline specification, then execute each step:
+先读 `shared/analysis_contract.md`；未核实买点用“未估值/待核实”，不强行生成数值。
 
 ### Step 1: Python Valuation Computation
 ```bash
 .venv/bin/python scripts/valuation_engine.py --code $ARGUMENTS --output-dir output/{code}_{company}/
 ```
-- Collects fresh data via AKShare (free, no token), computes classification + WACC + all valuation methods
+- 先用采集器刷新行情/§17并保存共享快照；估值引擎读取同目录快照，不独立改换行情。模型不适用时显示原因。
 - Outputs: output/{code}_{company}/valuation_computed.md
 - Contains: company type, WACC, each method's result + 5×5 sensitivity tables, cross-validation
 
@@ -35,6 +36,7 @@ Read strategies/valuation/coordinator.md for the full pipeline specification, th
 - Apply qualitative adjustments: D1 revenue quality → growth rate, D2 moat → terminal growth, D3 cycle → scenario weights, D4 management → governance discount
 - Select adjusted scenarios from sensitivity tables (no arithmetic needed — 查表选行，禁止自算)
 - Output: output/{code}_{company}/{company}_{code}_估值报告.md
+- 最终单独审计估值报告并生成valuation_audit.md，绑定报告/metrics哈希；按valuation类型运行report_consistency.py --gates --metrics <dir>/decision_metrics.json --require-audit <dir>/valuation_audit.md --require-cleanroom <dir>/cleanroom_metrics.md。
 
 ## Error Recovery
 - Missing qualitative_report.md → stop and prompt user to run /business-analysis first

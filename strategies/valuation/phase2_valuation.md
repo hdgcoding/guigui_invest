@@ -225,3 +225,6 @@ Python 默认使用 DPS CAGR 作为 DDM Phase 1 增长率。需要两层修正�
 | 某方法在 computed 中缺失 | 正常——Python 已跳过该方法 |
 | 敏感性表中找不到精确匹配的坐标 | 选取最接近的坐标，标注近似 |
 | valuation_computed.md 不存在 | **ABORT**："请先运行 valuation_engine.py" |
+# 数据约束
+
+先读 `shared/analysis_contract.md`。DCF/其他模型因数据口径不适用时，不可通过LLM调整恢复数值。决策卡只能使用已核实的确定性买点，缺失写“未估值/待核实”。

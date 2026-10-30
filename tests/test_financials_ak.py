@@ -141,6 +141,6 @@ class TestDividendsNormalization:
             "现金分红-现金分红比例描述": ["10派9.00元"],
         })
         monkeypatch.setattr(client, "_fetch_with_retry", lambda fetch: raw)
-        client.get_dividends("600887.SH")
+        md = client.get_dividends("600887.SH")
         assert client._store["dividends"].empty
-        assert "暂无已实施分红" in "" or True  # display degrades
+        assert "暂无已实施分红" in md

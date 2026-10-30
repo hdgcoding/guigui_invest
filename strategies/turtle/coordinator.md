@@ -86,14 +86,14 @@
 │  qualitative_report.md 存在？ → 必须               │
 │  data_pack_market.md 存在？ → 必须                 │
 │  data_pack_report.md 存在？ → 可选（降级方案）      │
-│    不满足 → 提示运行 /business-analysis，停止       │
+│    不满足 → 自动先执行 /business-analysis完整流程   │
 └──────────┬──────────────────────────────────────┘
            │
            ▼
 ┌─────────────────────────────────────────────────┐
 │  Step A: 市场数据刷新                              │
 │  akshare_collector.py --refresh-market            │
-│  → 更新 §1/§2/§11/§14（股价/市值/周线/Rf）        │
+│  → 更新行情、按TTL重载财报并重算§17/共享快照       │
 │  → 超过7天自动降级为全量采集                        │
 └──────────┬──────────────────────────────────────┘
            │
@@ -133,7 +133,7 @@ bash init.sh   # 创建 .venv 并安装依赖（pandas / akshare / pdfplumber �
 
 ```
 # === 使用 --refresh-market 模式刷新市场敏感数据 ===
-# data_pack_market.md 已由 /business-analysis 生成，仅刷新 §1/§2/§11/§14
+# 先读 shared/analysis_contract.md；刷新行情并重算§17，估值使用同一data_snapshot.json
 # 超过 7 天自动降级为全量采集
 
 Bash(
@@ -145,6 +145,7 @@ Bash(
 ### Phase 3：分析与报告
 
 等待 Step A 完成后启动。
+先执行估值引擎：`.venv/bin/python scripts/valuation_engine.py --code {ts_code} --output-dir {output_dir}`，使用同目录快照。数据缺失/跨表版本不一致时保留未核实，不强行恢复数值。
 
 **条件加载规则**（协调器在启动 Agent B 时根据股票代码判断）：
 - 港股 (.HK) → Agent B prompt 中额外指令：`同时加载 {shared_dir}/qualitative/references/market_rules_hk.md`
@@ -225,7 +226,7 @@ Task(
 
 | data_pack_market.md 年龄 | 行为 |
 |--------------------------|------|
-| ≤ 7 天 | --refresh-market 模式：仅刷新 §1/§2/§11/§14 |
+| ≤ 7 天 | 强制刷新行情；财报按TTL重新载入；§17与决策证据重算 |
 | > 7 天 | 自动降级为全量采集（可能有新季报发布） |
 
 > 中报时效性、PDF 下载等均由 `/business-analysis` 负责。龟龟策略不再管理 PDF 流程。
@@ -236,11 +237,11 @@ Task(
 
 | 阶段 | 最大执行时间 | 超时行为 |
 |------|------------|---------|
-| Step A 市场数据刷新 | 1分钟 | --refresh-market 仅4个section，极快 |
+| Step A 市场数据刷新 | 按实际数据量 | 超时标明缺失，不复用失效§17 |
 | Phase 3.1 Agent B（含Step 0） | 10分钟 | 已完成步骤保留 |
 | Phase 3.2 Agent C | 5分钟 | 输出已有结论 |
 
-超时后，协调器应立即推进下一阶段，不等待。总管线预计最大执行时间 ≤ 16分钟。
+超时可以生成降级说明，但不得跳过审计后声称完成；不能以固定总时长承诺替代实际执行记录。
 
 ---
 
@@ -248,8 +249,8 @@ Task(
 
 | 异常情况 | 处理方式 |
 |---------|---------|
-| qualitative_report.md 不存在 | 停止，提示用户运行 /business-analysis |
-| data_pack_market.md 不存在 | 停止，提示用户运行 /business-analysis |
+| qualitative_report.md 不存在 | 自动执行/business-analysis，必须完成真实审计门 |
+| data_pack_market.md 不存在 | 自动执行/business-analysis数据采集阶段 |
 | data_pack_report.md 不存在 | 继续（Agent B 降级方案：无附注数据） |
 | 个别 AKShare 接口失败 | 脚本自动降级标注"数据缺失"，Agent 后续用 WebSearch 补充 |
 | Step A --refresh-market 失败 | 检查 Python 环境和依赖，提示安装 |
@@ -259,6 +260,7 @@ Task(
 ---
 
 ## 文件路径约定
+最终交付前单独审计策略报告，生成final_audit.md（不复用BA审计，按shared/analysis_contract.md绑定报告/metrics哈希）。执行：`report_consistency.py --report {output_dir}/{company}_{code}_分析报告.md --report-type turtle --gates --metrics {output_dir}/decision_metrics.json --require-audit {output_dir}/final_audit.md --require-cleanroom {output_dir}/cleanroom_metrics.md`。审计产物缺失/未通过时只能交付明确标识的降级或撤回说明，不能伪造PASS。
 
 每个标的的运行时输出放在独立文件夹中，避免多次分析互相覆盖。
 
@@ -291,7 +293,7 @@ Task(
 │       └── judgment_examples_turtle.md         ← G系数/分配意愿/λ锚点（龟龟专属）
 ├── scripts/                                    ← 预处理脚本（只读）
 │   ├── akshare_collector.py                    ← 数据采集脚本（支持 --refresh-market）
-│   ├── pdf_preprocessor.py                     ← PDF 预处理脚本（BA 扫描件 fallback 用）
+│   ├── pdf_preprocessor.py                     ← PDF文本优先预处理（不含OCR）
 │   ├── config.py                               ← 代码验证/环境配置
 │   └── requirements.txt                        ← Python 依赖
 └── output/                                     ← 运行时输出（按标的隔离）

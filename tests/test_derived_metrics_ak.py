@@ -162,6 +162,7 @@ class TestDerivedMetricsSmoke:
                 "stk_div": [0, 0, 0, 0, 0],
                 "base_share": [632536.5, 632536.5, 636590.0, 636610.0, 639935.0],
                 "div_proc": ["实施"] * 5,
+                "ex_date": ["2026-06-05", "2025-12-17", "2025-06-06", "2024-06-06", "2023-06-06"],
             }),
             "weekly_prices": pd.DataFrame({
                 "trade_date": [f"{y}{m:02d}{d:02d}"

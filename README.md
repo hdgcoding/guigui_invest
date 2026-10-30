@@ -1,6 +1,8 @@
 # 龟龟投资框架 · AKShare + OpenCode/GLM 版（guigui_invest）
 
-AI 辅助的 A 股基本面分析系统。混合架构：**Python 脚本完成确定性数据采集与估值计算，LLM（GLM，通过 OpenCode 运行）按提示词驱动定性分析与多因子评估**。
+AI 辅助的 A 股基本面分析系统。混合架构：**Python完成确定性数据采集与估值计算，LLM通过OpenCode运行定性分析与多因子评估**。可选GLM；实际模型继承会话设置，仓库不固定provider/model。
+
+**先读 [数据与交付约束](shared/analysis_contract.md)**：未核实≠0≠通过；参考估值不是已验证买点。存量报告的校核/撤回状态以报告第一屏为准。
 
 > 复刻自 [Turtle Investment Framework](https://github.com/terancejiang/Turtle_investment_framework)（MIT License），两项核心替换：
 > 1. 数据源 **Tushare → AKShare**（免费、无需 Token）
@@ -77,14 +79,16 @@ output/{code}_{company}/  报告 .md + .html
 过滤：排除 ST/PT/退市/银行（可配）→ 上市 ≥3 年 → 市值 ≥5 亿 → 日成交额 ≥0.1 亿（换手率代理）→ 0<PB≤10 → 双通道 PE（主通道 0<PE≤50 + 股息率>0；观察通道亏损股按市值前 50）→ 排名 `0.4×dv + 0.3×(1/PE) + 0.3×(1/PB)`（归一化）取前 150。
 
 **Tier 2 — 深度分析**（逐只，复用 AKShareClient 采集器 + TTL 缓存）：
-- 硬否决：质押比 >70%（审计意见 AKShare 不可得，跳过）
+- 硬否决：质押比 >70%；审计意见没有稳定自动来源时标“未核实”，不冒充通过
 - 财务质量：ROE ≥8%、毛利率 ≥15%、资产负债率 ≤70%（新浪指标限流时自动从三大报表推导）
-- 因子 2：M（3 年支付率）/ AA / 穿透率 R / 门槛 II（max(3.5%, Rf+2%)）
+- 因子 2：完整财政年度归母支付率M；现金代理AA_proxy/R_proxy与已核实R分开，未完成归母现金穿透不生成买点
 - 因子 4：EV/EBITDA / FCF 收益率 / 现金调整 PE / 商誉占比
-- 底价 5 法均值：净流动资产/BVPS/10 年低点/股息隐含/悲观 FCF
+- 历史参考价：净流动资产/BVPS/10年低点/完整年度股息/悲观FCF；非正和缺失项排除，不足3项不合成；不是保底价
 - 综合评分：ROE 20% + FCF 收益率 20% + 穿透率 R 25% + EV/EBITDA(逆) 15% + 底价溢价(逆) 20%
 
 > 注：Tier 1 的 PE 为静态口径（最新年报 EPS），与原版 PE_TTM 略有差异（文档化近似）。
+输出列名为`pe_static`。成交额代理可配`min_daily_amount_yuan`，不冒充真实换手率。非分红股票可使用年报净利润/EPS的加权股本代理进入观察通道，股本来源随结果输出，Tier2需复核。默认导出CSV，HTML仅指定`--html`时生成。
+观察通道默认不要求ROE为正（否则亏损股会被全部拒绝）；仍要求现金流、毛利和负债指标合格，可通过`min_roe_obs`显式设置ROE下限。观察候选不等于通过买入资格审查。
 
 ## PDF-first 深度分析（GLM 文本优先）
 
@@ -96,9 +100,11 @@ output/{code}_{company}/  报告 .md + .html
   --text-output output/{code}_{company}/pdf_sections_text.md --full-text
 ```
 
-产出（伊利 2025 年报 259 页实测，7/7 章节命中）：
-- `pdf_sections_text.md` — 7 章节摘要（P2 治理/P3 会计政策/P4 应收/P6 合并报表/P13 风险/MDA/SUB）
+产出（关键词命中率不等于完整章节覆盖率）：
+- `pdf_sections_text.md` — 关键词上下文（P2受限资产/P3应收账龄/P4关联交易/P6或有负债与承诺/P13非经常性损益/MDA/SUB）
 - `pdf_sections_text_fulltext_part1..N.md` — 全文分片（~120K 字符/片），Agent 按需读取
+- `pdf_sections_text_manifest.json` — 页码与分片映射、空白页与候选章节页；分片重跑清理本程序的多余旧分片
+- 扫描/乱码PDF返回失败并要求OCR/外部来源补充；当前没有OCR，不能声称已读完整年报
 
 `/business-analysis` 命令已内置该流程：先读章节摘要 → 需要时按优先级读全文分片 → 提取附注生成 `data_pack_report.md`。
 
@@ -108,7 +114,7 @@ output/{code}_{company}/  报告 .md + .html
 # 数据采集（完整 §1–§17 数据包）
 .venv/bin/python scripts/akshare_collector.py --code 600887
 
-# 仅刷新市场数据段（§1/§2/§11/§14，<10s）
+# 强制刷新行情、按TTL重载财报、重新计算§17（不保留旧估值网格）
 .venv/bin/python scripts/akshare_collector.py --code 600887 --refresh-market
 
 # 刷新缓存 / 绕过缓存
@@ -116,6 +122,7 @@ output/{code}_{company}/  报告 .md + .html
 .venv/bin/python scripts/akshare_collector.py --code 600887 --no-cache
 
 # 估值引擎（分类 + WACC + DCF/DDM/PE Band + 敏感性表）
+# 自动使用同目录data_snapshot.json；超24小时须先刷新，避免两份数据口径
 .venv/bin/python scripts/valuation_engine.py --code 600887 --output-dir output/600887_伊利股份/
 
 # 选股器（两级筛选）
@@ -134,6 +141,8 @@ output/{code}_{company}/  报告 .md + .html
 # 质量杠杆脚本
 .venv/bin/python scripts/quality_control.py --input <data_pack> --output <computed_metrics>
 .venv/bin/python scripts/report_consistency.py --report <report> --output <consistency> --gates
+# 完整龟龟报告交付：报告类型、同次确定性证据、真实独立审计产物
+.venv/bin/python scripts/report_consistency.py --report <report> --report-type turtle --gates --metrics <dir>/decision_metrics.json --require-audit <dir>/final_audit.md --require-cleanroom <dir>/cleanroom_metrics.md
 
 # MD → HTML 仪表盘
 .venv/bin/python scripts/report_to_html.py --input <report.md> --output <report.html> --standalone
@@ -145,7 +154,7 @@ output/{code}_{company}/  报告 .md + .html
 guigui_invest/
 ├── .opencode/
 │   ├── command/                 # OpenCode slash 命令（business/valuation/turtle/download）
-│   └── skill/turtle-analysis/   # turtle-analysis 技能定义
+│   └── skills/turtle-analysis/  # turtle-analysis 技能定义（标准复数路径）
 ├── AGENTS.md                    # OpenCode 项目指令（入口文档）
 ├── shared/qualitative/          # 共享定性分析模块（D1–D6 六维度 + 审计门）
 ├── strategies/
@@ -162,7 +171,7 @@ guigui_invest/
 │   ├── pdf_preprocessor.py      # 年报 PDF 章节提取 + 文本导出（--text-output/--full-text）
 │   ├── download_report.py       # 年报 PDF 下载
 │   └── report_to_html.py        # MD → HTML 仪表盘
-├── tests/                       # 51 个测试（Mock 数据，无需网络）
+├── tests/                       # Mock回归测试（无需网络）
 └── output/                      # 输出目录（gitignored）
 ```
 
@@ -174,6 +183,9 @@ guigui_invest/
 4. **缓存**：财报类 7 天、行情类 24 小时（`output/.collector_cache/`，Parquet TTL）
 5. **数值纪律**：LLM 只引用 §17 预计算结果，有网格时查表选行，禁止自算
 6. **无需 Token**：AKShare 免费
+7. **数据能力边界**：D&A补充东财/同花顺且避免重复折旧；母公司报表仅接受明确母公司数据；审计意见待来源核实。跨表公告版本相差>45天会阻断复合指标，须人工/年报对齐，不能认为三张最新表天然可比。
+8. **模型适用性**：DDM仅用完整已实施分红年度；负历史增长只作有限期情景，终值增长显式列出。DCF只接受已核对的FCFF及完整现金/债务/少数股东转换数据，不把OCF−Capex直接当FCFF。
+9. **来源补充**：可用[financial_supplement.json规范](shared/financial_supplement_schema.md)恢复已从年报核对的母公司表、审计意见、归母现金、FCFF和实际股本；每项须有来源/页码/核对说明。缺失不会永久禁用功能，但不可用猜测开启模型。
 
 ## 测试
 

@@ -47,7 +47,8 @@ class ScreenerConfig:
     # --- Tier 1: Hard filters ---
     min_listing_years: int = 3
     min_market_cap_yi: float = 5.0  # 亿元
-    min_turnover_pct: float = 0.1   # %
+    min_turnover_pct: float = 0.1   # deprecated; Sina does not expose turnover rate
+    min_daily_amount_yuan: float = 1e7  # explicit liquidity proxy, not turnover %
     max_pb: float = 10.0
     max_pe: float = 50.0
     include_bank: bool = False  # 是否包含银行股
@@ -70,7 +71,7 @@ class ScreenerConfig:
     max_debt_ratio: float = 70.0     # %
 
     # --- Tier 2: Observation channel quality (relaxed vs main) ---
-    min_roe_obs: float = 0.0                # vs 8% for main channel
+    min_roe_obs: float | None = None        # loss observation is not main-channel ROE qualification
     min_fcf_margin_obs: float = 0.0         # FCF/Revenue >= 0%
     min_fcf_positive_years_obs: int = 2     # FCF positive in >= 2 of 5 years
     obs_require_ocf_positive: bool = True   # Latest year OCF > 0
@@ -120,6 +121,8 @@ class ScreenerConfig:
             errors.append("min_listing_years must be >= 0")
         if self.min_market_cap_yi < 0:
             errors.append("min_market_cap_yi must be >= 0")
+        if self.min_daily_amount_yuan < 0:
+            errors.append("min_daily_amount_yuan must be >= 0")
         if self.tier2_main_limit < 1:
             errors.append("tier2_main_limit must be >= 1")
         if self.obs_channel_limit < 0:

@@ -6,6 +6,7 @@ Section 17 derived metrics: financial trends, Factor 2/3/4 computations.
 import pandas as pd
 
 from format_utils import format_number, format_table, format_header
+from financial_contracts import depreciation, debt as financial_debt
 
 
 class DerivedMetricsMixin:
@@ -30,13 +31,12 @@ class DerivedMetricsMixin:
 
         # CAGR calculation
         def _cagr(series: list[tuple[str, float | None]]) -> str:
-            vals = [v for _, v in series if v is not None and v > 0]
-            if len(vals) < 2:
+            if len(series) < 2:
                 return "—"
             # series is desc order: [latest, ..., oldest]
-            latest, oldest = vals[0], vals[-1]
-            n = len(vals) - 1
-            if oldest <= 0:
+            latest, oldest = series[0][1], series[-1][1]
+            n = int(series[0][0]) - int(series[-1][0])
+            if latest is None or oldest is None or latest <= 0 or oldest <= 0 or n <= 0:
                 return "—"
             cagr = (latest / oldest) ** (1 / n) - 1
             return f"{cagr * 100:.2f}%"
@@ -46,15 +46,7 @@ class DerivedMetricsMixin:
 
         # --- Interest-bearing debt per year ---
         def _interest_bearing_debt(row) -> float | None:
-            components = ["st_borr", "lt_borr", "bond_payable", "non_cur_liab_due_1y"]
-            total = 0.0
-            any_valid = False
-            for c in components:
-                v = self._safe_float(row.get(c))
-                if v is not None:
-                    total += v
-                    any_valid = True
-            return total if any_valid else None
+            return financial_debt(row)
 
         debt_series = []  # (year, debt_raw)
         debt_ratio_series = []  # (year, ratio_pct)
@@ -94,7 +86,7 @@ class DerivedMetricsMixin:
                     return v
             return None
 
-        headers = ["指标"] + years_labels + ["5年CAGR"]
+        headers = ["指标"] + years_labels + ["样本期CAGR（实际年数）"]
         rows = []
 
         # Revenue
@@ -201,8 +193,7 @@ class DerivedMetricsMixin:
                 depr = self._safe_float(r.get("depr_fa_coga_dpba"))
                 amort_i = self._safe_float(r.get("amort_intang_assets"))
                 amort_d = self._safe_float(r.get("lt_amort_deferred_exp"))
-                da_components = [v for v in [depr, amort_i, amort_d] if v is not None]
-                da = sum(da_components) if da_components else None
+                da = depreciation(r)
 
                 capex = self._safe_float(r.get("c_pay_acq_const_fiolta"))
                 ocf = self._safe_float(r.get("n_cashflow_act"))
@@ -368,20 +359,14 @@ class DerivedMetricsMixin:
 
         latest_consol = bs_df.iloc[0]
         latest_parent = bs_parent_df.iloc[0]
-
-        def _debt(row):
-            components = ["st_borr", "lt_borr", "bond_payable", "non_cur_liab_due_1y"]
-            total = 0.0
-            for c in components:
-                v = self._safe_float(row.get(c))
-                if v:
-                    total += v
-            return total
-
-        consol_debt = _debt(latest_consol)
-        parent_debt = _debt(latest_parent)
-        consol_cash = self._safe_float(latest_consol.get("money_cap")) or 0
-        parent_cash = self._safe_float(latest_parent.get("money_cap")) or 0
+        if str(latest_consol["end_date"]) != str(latest_parent["end_date"]):
+            return "### 17.7 控股结构辅助\n\n⚠️ 母公司/合并报表期间不一致，不作差额推断。"
+        consol_debt = financial_debt(latest_consol)
+        parent_debt = financial_debt(latest_parent)
+        consol_cash = self._safe_float(latest_consol.get("money_cap"))
+        parent_cash = self._safe_float(latest_parent.get("money_cap"))
+        if any(value is None for value in (consol_debt, parent_debt, consol_cash, parent_cash)):
+            return "### 17.7 控股结构辅助\n\n⚠️ 现金/债务分项缺失，不按0推断母公司或子公司安全性。"
 
         rows = [
             ["有息负债", format_number(consol_debt), format_number(parent_debt)],
@@ -460,7 +445,11 @@ class DerivedMetricsMixin:
                     total += v
             return total
 
-        ibd_yuan = _ibd_yuan(latest_bs)
+        from financial_contracts import debt, depreciation, annual_dividends
+        ibd_yuan = debt(latest_bs)
+        if ibd_yuan is None or any(self._safe_float(latest_bs.get(k)) is None for k in
+                                   ("money_cap", "trad_asset", "total_assets", "total_hldr_eqy_exc_min_int", "minority_int")):
+            return "### 17.8 因子4·估值参考\n\n⚠️ 现金/债务/权益等关键字段缺失；禁止按0计算安全边际。"
         cash_yuan = self._safe_float(latest_bs.get("money_cap")) or 0
         trad_yuan = self._safe_float(latest_bs.get("trad_asset")) or 0
         goodwill_yuan = self._safe_float(latest_bs.get("goodwill")) or 0
@@ -471,15 +460,11 @@ class DerivedMetricsMixin:
         finance_exp_yuan = self._safe_float(latest_inc.get("finance_exp")) or 0
         np_parent_yuan = self._safe_float(latest_inc.get("n_income_attr_p")) or 0
 
-        da_yuan = 0.0
-        for c in ["depr_fa_coga_dpba", "amort_intang_assets", "lt_amort_deferred_exp"]:
-            v = self._safe_float(latest_cf.get(c))
-            if v:
-                da_yuan += v
+        da_yuan = depreciation(latest_cf)
 
-        ocf_yuan = self._safe_float(latest_cf.get("n_cashflow_act")) or 0
-        capex_yuan = self._safe_float(latest_cf.get("c_pay_acq_const_fiolta")) or 0
-        fcf_yuan = ocf_yuan - capex_yuan
+        ocf_yuan = self._safe_float(latest_cf.get("n_cashflow_act"))
+        capex_yuan = self._safe_float(latest_cf.get("c_pay_acq_const_fiolta"))
+        fcf_yuan = ocf_yuan - abs(capex_yuan) if ocf_yuan is not None and capex_yuan is not None else None
 
         # Convert to 百万元
         ibd = ibd_yuan / 1e6
@@ -491,12 +476,15 @@ class DerivedMetricsMixin:
         oper_profit = oper_profit_yuan / 1e6
         fin_exp = finance_exp_yuan / 1e6
         np_parent = np_parent_yuan / 1e6
-        da = da_yuan / 1e6
-        fcf = fcf_yuan / 1e6
+        da = da_yuan / 1e6 if da_yuan is not None else None
+        fcf = fcf_yuan / 1e6 if fcf_yuan is not None else None
 
         # ===== Part A: Valuation indicators =====
         # Manual calculations (fallback)
-        ebitda = oper_profit + fin_exp + da
+        # Approximation, not statutory EBITDA: finance expense includes FX and
+        # interest income. Do not fabricate EBITDA when D&A is unavailable.
+        ebitda = oper_profit + fin_exp + da if da is not None and all(
+            self._safe_float(latest_inc.get(k)) is not None for k in ("operate_profit", "finance_exp")) else None
         net_debt = ibd - cash  # positive = net debt, negative = net cash
 
         # Prefer fina_indicator pre-computed values when available
@@ -517,28 +505,27 @@ class DerivedMetricsMixin:
                 if v is not None:
                     fcf = v / 1e6
 
-        ev = mkt_cap + net_debt
+        minority_equity = self._safe_float(latest_bs.get("minority_int")) / 1e6
+        ev = mkt_cap + net_debt + minority_equity
         net_cash = -net_debt
 
-        ev_ebitda = f"{ev / ebitda:.2f}x" if ebitda > 0 else "—"
+        ev_ebitda = f"{ev / ebitda:.2f}x" if ebitda is not None and ebitda > 0 else "—"
         cash_pe = f"{(mkt_cap - net_cash) / np_parent:.2f}x" if np_parent > 0 else "—"
-        fcf_yield = f"{fcf / mkt_cap * 100:.2f}%" if mkt_cap > 0 else "—"
+        fcf_yield = f"{fcf / mkt_cap * 100:.2f}%" if fcf is not None and mkt_cap > 0 else "—"
         pb = f"{mkt_cap / equity:.2f}x" if equity > 0 else "—"
-        net_debt_ebitda = f"{net_debt / ebitda:.2f}x" if ebitda > 0 else "—"
+        net_debt_ebitda = f"{net_debt / ebitda:.2f}x" if ebitda is not None and ebitda > 0 else "—"
         goodwill_ratio = f"{goodwill / ta * 100:.2f}%" if ta > 0 else "—"
         ibd_ratio = f"{ibd / ta * 100:.2f}%" if ta > 0 else "—"
 
-        # Dividend yield: latest DPS / close
+        # Annual yield: complete fiscal year, not the latest single payment.
         div_yield_str = "—"
         div_df = self._store.get("dividends")
-        latest_dps = None
-        if div_df is not None and not div_df.empty:
-            sorted_div = div_df.sort_values("end_date", ascending=False)
-            latest_dps = self._safe_float(sorted_div.iloc[0].get("cash_div_tax"))
-            if latest_dps is not None and close > 0:
-                div_yield_str = f"{latest_dps / close * 100:.2f}%"
+        complete_divs = annual_dividends(self._store.get("dividends_all", div_df), self._store.get("as_of"))
+        latest_dps = complete_divs[0]["dps"] if complete_divs else None
+        if latest_dps is not None and close > 0:
+            div_yield_str = f"{latest_dps / close * 100:.2f}%"
 
-        lines = [format_header(3, '17.8 因子4·绝对估值与"买入就是胜利"基准价'), ""]
+        lines = [format_header(3, '17.8 因子4·绝对估值与历史参考基准（非保底价）'), ""]
 
         # Valuation table
         lines.append("#### 估值指标")
@@ -546,8 +533,8 @@ class DerivedMetricsMixin:
         fmt = lambda v: format_number(v, divider=1)
         val_rows = [
             [f"总市值（{self._unit_label()}）", fmt(mkt_cap), "—"],
-            [f"企业价值 EV（{self._unit_label()}）", fmt(ev), "市值+有息负债-现金"],
-            [f"EBITDA（{self._unit_label()}）", fmt(ebitda), "营业利润+财务费用+D&A"],
+            [f"企业价值 EV近似值（{self._unit_label()}）", fmt(ev), "归母市值+有息负债-现金+少数股东权益账面代理"],
+            [f"EBITDA近似值（{self._unit_label()}）", fmt(ebitda), "营业利润+带符号财务费用+D&A；非标准EBITDA"],
             ["EV/EBITDA", ev_ebitda, "—"],
             ["扣除现金PE", cash_pe, "(市值-净现金)/归母净利润"],
             ["FCF收益率", fcf_yield, "FCF/市值"],
@@ -555,14 +542,14 @@ class DerivedMetricsMixin:
             ["净负债/EBITDA", net_debt_ebitda, "(有息负债-现金)/EBITDA，负值=净现金"],
             ["商誉/总资产", goodwill_ratio, "—"],
             ["有息负债率", ibd_ratio, "有息负债/总资产"],
-            ["股息率", div_yield_str, "最新DPS/当前股价"],
+            ["股息率", div_yield_str, "最近完整分红年度DPS合计/当前股价"],
         ]
         lines.append(format_table(["指标", "值", "说明"], val_rows,
                                   alignments=["l", "r", "l"]))
         lines.append("")
 
         # ===== Part B: "买入就是胜利" baselines =====
-        lines.append('#### "买入就是胜利"基准价')
+        lines.append('#### 多法参考价（不保证本金安全，不构成买点）')
         lines.append("")
 
         baselines = []  # (name, value_yuan_per_share, logic)
@@ -588,14 +575,9 @@ class DerivedMetricsMixin:
         if rf_df is not None and not rf_df.empty:
             rf_pct = self._safe_float(rf_df.iloc[0].get("yield"))
 
-        if div_df is not None and not div_df.empty and rf_pct is not None:
-            sorted_div = div_df.sort_values("end_date", ascending=False)
-            recent_dps = []
-            for _, row in sorted_div.head(3).iterrows():
-                v = self._safe_float(row.get("cash_div_tax"))
-                if v is not None:
-                    recent_dps.append(v)
-            if recent_dps:
+        if complete_divs and rf_pct is not None:
+            recent_dps = [r["dps"] for r in complete_divs[:3]]
+            if len(recent_dps) == 3:
                 avg_dps = sum(recent_dps) / len(recent_dps)
                 discount = max(rf_pct / 100, 0.03)
                 implied_price = avg_dps / discount
@@ -609,11 +591,11 @@ class DerivedMetricsMixin:
                 ocf_v = self._safe_float(row.get("n_cashflow_act"))
                 cap_v = self._safe_float(row.get("c_pay_acq_const_fiolta"))
                 if ocf_v is not None and cap_v is not None:
-                    fcf_list.append(ocf_v - cap_v)
+                    fcf_list.append(ocf_v - abs(cap_v))
             if fcf_list and min(fcf_list) <= 0:
                 lines.append("> ⑤ 悲观FCF资本化：跳过（存在负FCF年份）")
                 lines.append("")
-            if fcf_list and min(fcf_list) > 0:
+            if len(fcf_list) >= 3 and min(fcf_list) > 0:
                 min_fcf = min(fcf_list)
                 cap_price = min_fcf / (rf_pct / 100) / total_shares
                 baselines.append(("⑤ 悲观FCF资本化", cap_price,
@@ -623,6 +605,9 @@ class DerivedMetricsMixin:
         bl_rows = []
         valid_prices = []
         for name, val, logic in baselines:
+            if val <= 0:
+                lines.append(f"> {name}: {val:.2f}（非正参考值，不纳入综合价）")
+                continue
             bl_rows.append([name, f"{val:.2f}", logic])
             valid_prices.append(val)
 
@@ -631,7 +616,7 @@ class DerivedMetricsMixin:
         lines.append("")
 
         # ===== Part C: Composite baseline =====
-        if valid_prices:
+        if len(valid_prices) >= 3:
             composite = sum(valid_prices) / len(valid_prices)
 
             lines.append(f"**综合基准价（算术平均）= {composite:.2f} {self._price_unit()}**")
@@ -644,9 +629,9 @@ class DerivedMetricsMixin:
             lines.append(f"当前股价 {close:.2f} {self._price_unit()}，较基准价溢价 **{premium:.1f}%**")
 
             if premium <= 0:
-                verdict = "低于基准线 — 买入就是胜利"
+                verdict = "低于历史参考线 — 仍须通过盈利、估值及风险审核"
             elif premium <= 30:
-                verdict = "接近基准线 — 安全边际充足"
+                verdict = "接近历史参考线 — 不代表安全边际已验证"
             elif premium <= 80:
                 verdict = "合理溢价 — 需确认成长性"
             elif premium <= 150:
@@ -655,6 +640,8 @@ class DerivedMetricsMixin:
                 verdict = "显著溢价 — 高成长预期已定价"
 
             lines.append(f"→ {verdict}")
+        else:
+            lines.append("⚠️ 有效方法不足3项；不生成综合参考价及溢价。")
 
         return "\n".join(lines)
 
@@ -720,7 +707,7 @@ class DerivedMetricsMixin:
         payout_lookup = self._get_payout_by_year()
         years_labels = [str(r["end_date"])[:4] for _, r in income_df.iterrows()] if not income_df.empty else []
         payout_ratios = [payout_lookup[y] for y in years_labels[:3] if y in payout_lookup]
-        m_pct = sum(payout_ratios) / len(payout_ratios) if payout_ratios else None
+        m_pct = sum(payout_ratios) / 3 if len(payout_ratios) == 3 else None
         if m_pct is None:
             return None
 
@@ -742,11 +729,12 @@ class DerivedMetricsMixin:
                 format_number(aa_new),
                 f"{gg:.2f}%",
                 f"{vs_threshold:+.2f} pct",
-                f"{tp:.2f}",
-                f"{vs_price:+.1f}%",
+                f"{tp:.2f}" if tp > 0 and f3s.get("decision_eligible", False) and str(bi.get("shares_verified", False)).lower() == "true" else "—（未穿透/无正买点）",
+                f"{vs_price:+.1f}%" if tp > 0 and f3s.get("decision_eligible", False) and str(bi.get("shares_verified", False)).lower() == "true" else "—",
             ]
 
         lines = [format_header(3, "17.9 因子4·业绩下滑敏感性"), ""]
+        lines.append("> 仅为合并现金结余代理情景，不是归母可分配回报。未完成穿透时目标买入价留空。")
         lines.append(f"> AA（真实可支配现金结余）= {format_number(aa)} {self._unit_label()}，"
                      f"M = {m_pct:.2f}%，O = {format_number(o_val)}，"
                      f"II = {ii:.2f}%，市值 = {format_number(mkt_cap)} {self._unit_label()}")
@@ -825,13 +813,15 @@ class DerivedMetricsMixin:
                 continue
 
             # T = AR change (increase positive)
-            ar_cur = self._safe_float(bs_cur.get("accounts_receiv")) or 0
-            ar_prev = self._safe_float(bs_prev.get("accounts_receiv")) or 0
+            ar_cur = self._safe_float(bs_cur.get("accounts_receiv"))
+            ar_prev = self._safe_float(bs_prev.get("accounts_receiv"))
+            cl_cur = self._safe_float(bs_cur.get("contract_liab"))
+            cl_prev = self._safe_float(bs_prev.get("contract_liab"))
+            if any(v is None for v in (ar_cur, ar_prev, cl_cur, cl_prev)):
+                continue
             t = ar_cur - ar_prev
 
             # U = contract_liab change (increase positive)
-            cl_cur = self._safe_float(bs_cur.get("contract_liab")) or 0
-            cl_prev = self._safe_float(bs_prev.get("contract_liab")) or 0
             u = cl_cur - cl_prev
 
             # Conservative: deduct AR increases, deduct CL decreases
@@ -842,7 +832,7 @@ class DerivedMetricsMixin:
             true_cash_rev_store[year] = true_cash
 
         if not results:
-            return None
+            return "### 17.3 因子3·现金收入诊断\n\n⚠️ 同期应收/合同负债数据不足，不按0恢复现金收入。"
 
         # Store for §17.5
         self._store["_true_cash_rev"] = true_cash_rev_store
@@ -894,104 +884,47 @@ class DerivedMetricsMixin:
     def _compute_factor3_step4(self) -> str | None:
         """Compute §17.4: Operating cash outflows (步骤4).
 
-        W1 = oper_cost + max(0, -AP_change)
-        W2 = c_pay_to_staff (from cashflow)
-        W3 = income_tax - deferred_tax_net_change
-        W4 = finance_exp
-        Stores results in self._store["_w_total"] for §17.5.
+        W1/W2/W3/W4 are actual supplier/staff/tax/other operating cash
+        payments. This diagnostic does not replace the OCF-anchored AA.
         """
-        income_df = self._get_annual_df("income")
-        bs_df = self._get_annual_df("balance_sheet")
         cf_df = self._get_annual_df("cashflow")
-
-        if income_df.empty or bs_df.empty or cf_df.empty or len(income_df) < 2:
+        if cf_df.empty:
             return None
-
-        # Build lookups
-        bs_by_year = {}
-        for _, r in bs_df.iterrows():
-            bs_by_year[str(r["end_date"])[:4]] = r
-        cf_by_year = {}
-        for _, r in cf_df.iterrows():
-            cf_by_year[str(r["end_date"])[:4]] = r
-        inc_by_year = {}
-        for _, r in income_df.iterrows():
-            inc_by_year[str(r["end_date"])[:4]] = r
-
-        income_years = [str(r["end_date"])[:4] for _, r in income_df.iterrows()]
 
         results = []  # (year, W1, W2, W3, W4, W)
         w_total_store = {}
 
-        for year in income_years:
-            prior_year = str(int(year) - 1)
-            if year not in bs_by_year or prior_year not in bs_by_year:
+        for _, cf in cf_df.iterrows():
+            year = str(cf["end_date"])[:4]
+
+            # Actual cash payments avoid double counting accrual COGS/wages.
+            w1 = self._safe_float(cf.get("c_paid_goods_svr"))
+            w2 = self._safe_float(cf.get("c_pay_to_staff"))
+            w3 = self._safe_float(cf.get("c_paid_for_taxes"))
+            w4 = self._safe_float(cf.get("pay_other_oper"))
+            if any(v is None for v in (w1, w2, w3, w4)):
                 continue
-            if year not in cf_by_year or year not in inc_by_year:
-                continue
-
-            inc = inc_by_year[year]
-            bs_cur = bs_by_year[year]
-            bs_prev = bs_by_year[prior_year]
-            cf = cf_by_year[year]
-
-            # W1: supplier = oper_cost + max(0, -AP_change)
-            oper_cost = self._safe_float(inc.get("oper_cost")) or 0
-            ap_cur = self._safe_float(bs_cur.get("acct_payable")) or 0
-            ap_prev = self._safe_float(bs_prev.get("acct_payable")) or 0
-            ap_change = ap_cur - ap_prev
-            w1 = oper_cost + max(0, -ap_change)
-
-            # W2: employee = c_pay_to_staff (fallback to SGA if null)
-            w2_raw = self._safe_float(cf.get("c_pay_to_staff"))
-            w2_is_fallback = False
-            if w2_raw is None or w2_raw == 0:
-                # Fallback: SGA from income statement as proxy
-                selling = self._safe_float(inc.get("sell_exp")) or 0
-                admin = self._safe_float(inc.get("admin_exp")) or 0
-                rd = self._safe_float(inc.get("rd_exp")) or 0
-                w2 = selling + admin + rd
-                w2_is_fallback = w2 > 0  # only mark fallback if SGA produced a value
-            else:
-                w2 = w2_raw
-
-            # W3: cash tax = income_tax - (DTA_change - DTL_change)
-            income_tax = self._safe_float(inc.get("income_tax")) or 0
-            dta_cur = self._safe_float(bs_cur.get("defer_tax_assets")) or 0
-            dta_prev = self._safe_float(bs_prev.get("defer_tax_assets")) or 0
-            dtl_cur = self._safe_float(bs_cur.get("defer_tax_liab")) or 0
-            dtl_prev = self._safe_float(bs_prev.get("defer_tax_liab")) or 0
-            deferred_net_change = (dta_cur - dta_prev) - (dtl_cur - dtl_prev)
-            w3 = income_tax - deferred_net_change
-
-            # W4: interest = finance_exp
-            w4 = self._safe_float(inc.get("finance_exp")) or 0
-
             w = w1 + w2 + w3 + w4
-            results.append((year, w1, w2, w3, w4, w, w2_is_fallback))
+            results.append((year, w1, w2, w3, w4, w))
             w_total_store[year] = w
 
         if not results:
-            return None
+            return "### 17.4 因子3·经营现金支出\n\n⚠️ 现金支付分项缺失，不以营业成本/SGA代替，不输出W合计。"
 
-        # Store for §17.5
+        # Diagnostic only; §17.5 uses the reported operating cash flow.
         self._store["_w_total"] = w_total_store
 
         # Build output
         lines = [format_header(3, "17.4 因子3·步骤4 经营性现金支出"), ""]
+        lines.append("> W取现金流支付分项，不含融资利息；AA直接锚定OCF−Capex。")
 
-        headers = ["年份", "W1 供应商", "W2 员工", "W3 现金税", "W4 利息", "W 合计"]
+        headers = ["年份", "W1 供应商现金", "W2 员工现金", "W3 现金税", "W4 其他经营现金", "W 合计"]
         rows = []
-        has_w2_fallback = False
-        for year, w1, w2, w3, w4, w, w2_fb in results:
-            w2_display = format_number(w2)
-            if w2_fb:
-                w2_display += "†"
-                has_w2_fallback = True
+        for year, w1, w2, w3, w4, w in results:
             rows.append([
                 year,
                 format_number(w1),
-                w2_display,
+                format_number(w2),
                 format_number(w3),
                 format_number(w4),
                 format_number(w),
@@ -1000,224 +933,74 @@ class DerivedMetricsMixin:
                              alignments=["l"] + ["r"] * 5)
         lines.append(table)
 
-        # Footnote for W2 fallback
-        if has_w2_fallback:
-            lines.append("")
-            lines.append("> † W2: c_pay_to_staff 为空，已用利润表 SGA（销售+管理+研发费用）替代，偏保守。")
-
-        # Null-value warnings
-        warnings = []
-        for year, w1, w2, w3, w4, w, w2_fb in results:
-            inc = inc_by_year.get(year)
-            cf = cf_by_year.get(year)
-            if inc is not None:
-                if (self._safe_float(inc.get("oper_cost")) or 0) == 0:
-                    warnings.append(f"{year}: oper_cost 为空，W1 可能偏低")
-                total_profit = self._safe_float(inc.get("total_profit")) or 0
-                if (self._safe_float(inc.get("income_tax")) or 0) == 0 and total_profit > 0:
-                    warnings.append(f"{year}: income_tax 为空但利润总额>0，W3 可能偏低")
-        if warnings:
-            lines.append("")
-            for wm in warnings:
-                lines.append(f"> ⚠️ {wm}")
-
         return "\n".join(lines)
 
     def _compute_factor3_sensitivity_base(self) -> str | None:
-        """Compute §17.5: Base surplus + sensitivity inputs.
+        """Cash-flow anchored base: avoid adding wages to accrual COGS twice.
 
-        Base surplus = true_cash_revenue - W - Capex (per year, no V/X adjustments).
-        Also computes: AA_incl, AA_excl, revenue CV, λ, λ reliability.
-        Requires _compute_factor3_step1() and _compute_factor3_step4() to have run first.
+        OCF−Capex is a consolidated cash surplus proxy, NOT verified owner
+        earnings/FCFF. Minority distributions, restricted cash and one-offs
+        still require explicit source reconciliation before a buy decision.
         """
-        true_cash_rev = self._store.get("_true_cash_rev")
-        w_total = self._store.get("_w_total")
-        if not true_cash_rev or not w_total:
-            return None
-
-        cf_df = self._get_annual_df("cashflow")
-        income_df = self._get_annual_df("income")
-        if cf_df.empty or income_df.empty:
-            return None
-
-        # Capex by year
-        capex_by_year = {}
-        for _, r in cf_df.iterrows():
-            year = str(r["end_date"])[:4]
-            capex_by_year[year] = self._safe_float(r.get("c_pay_acq_const_fiolta")) or 0
-
-        # Revenue by year (for CV and λ)
-        rev_by_year = {}
-        for _, r in income_df.iterrows():
-            year = str(r["end_date"])[:4]
-            rev_by_year[year] = self._safe_float(r.get("revenue")) or 0
-
-        # Compute base surplus per year (only years with all data)
-        common_years = sorted(
-            set(true_cash_rev.keys()) & set(w_total.keys()) & set(capex_by_year.keys()),
-            reverse=True
-        )
-        if not common_years:
-            return None
-
-        surplus_data = []  # (year, tcr, w, capex, base_surplus)
-        for year in common_years:
-            tcr = true_cash_rev[year]
-            w = w_total[year]
-            capex = capex_by_year.get(year, 0)
-            base = tcr - w - capex
-            surplus_data.append((year, tcr, w, capex, base))
-
-        surpluses = [s[4] for s in surplus_data]
-
-        # AA_all: mean of all years (was aa_incl)
-        aa_all = sum(surpluses) / len(surpluses)
-
-        # AA_2y: mean of most recent 2 years (surplus_data sorted descending)
-        aa_2y = sum(surpluses[:2]) / min(2, len(surpluses)) if surpluses else aa_all
-
-        # AA_excl: exclude years where base_surplus < 0
-        positive_surpluses = [s for s in surpluses if s >= 0]
-        aa_excl = sum(positive_surpluses) / len(positive_surpluses) if positive_surpluses else aa_all
-
-        # Default: use AA_2y; fallback to AA_all if <2 years of data
-        aa_selected = aa_2y if len(surpluses) >= 2 else aa_all
-
-        # Store AA values for downstream use (§17.9 sensitivity)
-        self._store["factor3_sensitivity"] = {
-            "aa_incl": aa_all,  # legacy key for backward compatibility
-            "aa_all": aa_all,
-            "aa_2y": aa_2y,
-            "aa_excl": aa_excl,
-            "aa_selected": aa_selected,
-        }
-
-        # Revenue CV (all available years, not just change-computed years)
-        all_revenues = [rev_by_year[y] for y in sorted(rev_by_year.keys()) if rev_by_year[y] > 0]
-        cv = None
-        if len(all_revenues) >= 2:
-            import statistics
-            rev_mean = statistics.mean(all_revenues)
-            rev_stdev = statistics.pstdev(all_revenues)  # population stdev
-            cv = rev_stdev / rev_mean if rev_mean > 0 else None
-
-        # λ: median(ΔSurplus/ΔRevenue) over latest 3 year-pairs
-        lambda_vals = []
-        sorted_years_asc = sorted(common_years)
-        for i in range(1, len(sorted_years_asc)):
-            y_cur = sorted_years_asc[i]
-            y_prev = sorted_years_asc[i - 1]
-            delta_s = rev_by_year.get(y_cur, 0) - rev_by_year.get(y_prev, 0)
-            surplus_cur = next((s[4] for s in surplus_data if s[0] == y_cur), None)
-            surplus_prev = next((s[4] for s in surplus_data if s[0] == y_prev), None)
-            if surplus_cur is not None and surplus_prev is not None and delta_s != 0:
-                delta_surplus = surplus_cur - surplus_prev
-                lambda_vals.append(delta_surplus / delta_s)
-
-        # Use latest 3 pairs
-        lambda_vals = lambda_vals[-3:] if len(lambda_vals) > 3 else lambda_vals
         import statistics
-        lambda_median = statistics.median(lambda_vals) if lambda_vals else None
-
-        # λ reliability checks
-        lambda_warnings = []
-        if len(all_revenues) >= 3:
-            # Check 1: revenue amplitude over years used for λ
-            lambda_rev_years = sorted(common_years)
-            lambda_revs = [rev_by_year.get(y, 0) for y in lambda_rev_years if rev_by_year.get(y, 0) > 0]
-            if lambda_revs and min(lambda_revs) > 0:
-                amplitude = max(lambda_revs) / min(lambda_revs) - 1
-                if amplitude < 0.10:
-                    lambda_warnings.append("历史收入波幅不足10%，λ外推可靠性低")
-
-        # Check 2: sign consistency
-        if lambda_vals:
-            signs = [1 if v >= 0 else -1 for v in lambda_vals]
-            if len(set(signs)) > 1:
-                lambda_warnings.append("ΔSurplus/ΔRevenue符号不一致，成本结构可能变化")
-
-        # Check 3: λ range
-        if lambda_median is not None and (lambda_median > 3 or lambda_median < 0):
-            lambda_warnings.append(f"λ={lambda_median:.2f}异常，建议人工核查")
-
-        lambda_reliability = "正常"
-        if len(lambda_warnings) >= 2 or (lambda_median is not None and (lambda_median > 3 or lambda_median < 0)):
-            lambda_reliability = "多项警告或异常"
-        elif len(lambda_warnings) == 1:
-            lambda_reliability = "有一项警告"
-
-        # Augment stored dict with λ / CV fields for §17.13 (rendered output unchanged)
-        self._store["factor3_sensitivity"].update({
-            "lambda_median": lambda_median,
-            "lambda_reliability": lambda_reliability,
-            "lambda_warnings": lambda_warnings,
-            "cv": cv,
-        })
-
-        # Build output
-        lines = [format_header(3, "17.5 因子3·步骤7 基准可支配结余 + 敏感性输入"), ""]
-        lines.append("> 不含 V1/V5/-V_deduct/-X1/-X2 调整。LLM 需在此基础上加减调整项。")
-        lines.append("")
-
-        # Per-year table
-        headers = ["年份", "真实现金收入", "- W 经营支出", "- E 资本开支", "= 基准结余"]
-        rows = []
-        for year, tcr, w, capex, base in surplus_data:
-            rows.append([
-                year,
-                format_number(tcr),
-                format_number(w),
-                format_number(capex),
-                format_number(base),
-            ])
-        table = format_table(headers, rows, alignments=["l"] + ["r"] * 4)
-        lines.append(table)
-        lines.append("")
-
-        # Summary
-        lines.append(f"- AA_2y（近2年均值，默认基准）= {format_number(aa_2y)} {self._unit_label()}")
-        lines.append(f"- AA_all（全部年份均值）= {format_number(aa_all)} {self._unit_label()}")
-        lines.append(f"- AA_excl（剔除负值年份均值）= {format_number(aa_excl)} {self._unit_label()}")
-        diff_2y_all_pct = abs(aa_2y - aa_all) / abs(aa_all) * 100 if aa_all != 0 else 0
-        if diff_2y_all_pct > 30:
-            lines.append(f"  ⚠️ AA_2y 与 AA_all 差异 {diff_2y_all_pct:.1f}% > 30%，请审核近2年是否存在非经常性高峰")
-        lines.append(f"- 收入波动率 CV = {cv * 100:.2f}%" if cv is not None else "- 收入波动率 CV = —")
-        lines.append(f"- 经营杠杆系数 λ = {lambda_median:.4f}" if lambda_median is not None else "- 经营杠杆系数 λ = —")
-        lines.append(f"- λ可靠性 = {lambda_reliability}")
-        for w_msg in lambda_warnings:
-            lines.append(f"  ⚠️ {w_msg}")
-
-        # Capex null-value warnings
-        capex_warnings = []
-        for _, r in cf_df.iterrows():
-            year = str(r["end_date"])[:4]
-            if year in common_years:
-                if self._safe_float(r.get("c_pay_acq_const_fiolta")) is None:
-                    capex_warnings.append(f"{year}: capex（c_pay_acq_const_fiolta）为空，基准结余可能偏高")
-        if capex_warnings:
-            lines.append("")
-            for wm in capex_warnings:
-                lines.append(f"> ⚠️ {wm}")
-
-        # AA vs OCF cross-validation
-        ocf_values = []
-        for _, r in cf_df.iterrows():
-            year = str(r["end_date"])[:4]
-            if year in [s[0] for s in surplus_data]:
-                ocf = self._safe_float(r.get("n_cashflow_act"))
-                if ocf is not None:
-                    ocf_values.append(ocf)
-        if ocf_values:
-            ocf_avg = sum(ocf_values) / len(ocf_values)
-            if aa_selected > 0 and ocf_avg > 0 and aa_selected / ocf_avg > 2.0:
-                lines.append("")
-                lines.append(
-                    f"> ⚠️ AA/OCF = {aa_selected / ocf_avg:.1f}x，"
-                    f"基准结余远超经营现金流（均值 {format_number(ocf_avg)} {self._unit_label()}），"
-                    f"可能存在数据缺失导致 W 偏低"
-                )
-
+        cf = self._get_annual_df("cashflow")
+        inc = self._get_annual_df("income")
+        revenues = {str(r["end_date"])[:4]: self._safe_float(r.get("revenue")) for _, r in inc.iterrows()}
+        records = []
+        for _, row in cf.iterrows():
+            ocf = self._safe_float(row.get("n_cashflow_act"))
+            capex = self._safe_float(row.get("c_pay_acq_const_fiolta"))
+            if ocf is not None and capex is not None:
+                records.append((str(row["end_date"])[:4], ocf, abs(capex), ocf - abs(capex)))
+        owner_records = self._store.get("owner_cash_records", [])
+        owner_by_year = {str(row["end_date"])[:4]: row["owner_surplus_yuan"] for row in owner_records}
+        eligible = len(owner_by_year) >= 2 and len(records) >= 2 and all(
+            row[0] in owner_by_year for row in records[:2]) and int(records[0][0]) - int(records[1][0]) == 1
+        if eligible:
+            records = [(year, ocf, capex, owner_by_year[year]) for year, ocf, capex, _ in records if year in owner_by_year]
+        if len(records) < 2:
+            return "### 17.5 因子3·现金结余参考\n\n⚠️ 同口径有效年度不足2年，不输出AA或买点。"
+        values = [r[3] for r in records]
+        aa_all = statistics.mean(values)
+        aa_2y = statistics.mean(values[:2])
+        positive = [v for v in values if v >= 0]
+        pairs = []
+        for current, previous in zip(records, records[1:]):
+            a, b = revenues.get(current[0]), revenues.get(previous[0])
+            if int(current[0]) - int(previous[0]) == 1 and a is not None and b is not None and a != b:
+                pairs.append((current[3] - previous[3]) / (a - b))
+        lam = statistics.median(pairs[:3]) if pairs else None
+        revs = [v for v in revenues.values() if v is not None and v > 0]
+        warnings = []
+        if len(pairs) < 3:
+            warnings.append("连续年度样本不足3对")
+        if revs and max(revs) / min(revs) < 1.1:
+            warnings.append("历史收入波幅不足10%")
+        if pairs and len({v >= 0 for v in pairs}) > 1:
+            warnings.append("年度λ符号不一致")
+        if lam is not None and not 0 <= lam <= 3:
+            warnings.append("λ超出0–3，禁止作为买点依据")
+        self._store["factor3_sensitivity"] = {
+            "aa_incl": aa_all, "aa_all": aa_all, "aa_2y": aa_2y,
+            "aa_excl": statistics.mean(positive) if positive else aa_all,
+            "aa_selected": aa_2y, "basis": "source_reconciled_parent_cash" if eligible else "consolidated_OCF_minus_capex_proxy",
+            "decision_eligible": eligible, "lambda_median": lam,
+            "lambda_reliability": "正常" if not warnings else "待核实",
+            "lambda_warnings": warnings,
+            "cv": statistics.pstdev(revs) / statistics.mean(revs) if len(revs) >= 2 else None}
+        lines = ["### 17.5 因子3·现金流锚定结余参考", "",
+                 "> AA=来源核对归母现金，调整利息/少数股东/受限资金/非经常项目。" if eligible else
+                 "> AA代理=合并OCF−全部资本开支。非归母可分配现金；不得据此直接生成买点。",
+                 "> §17.3/§17.4的权责发生制重建仅作诊断，不再进入AA，以避免工资/折旧重复扣减。", "",
+                 format_table(["年份", "OCF", "资本开支", "现金结余代理"],
+                              [[y] + [format_number(v) for v in (o, cap, f)] for y, o, cap, f in records]), "",
+                 f"- AA_2y = {format_number(aa_2y)} 百万元（默认参考）",
+                 f"- AA_all = {format_number(aa_all)} 百万元",
+                 "- 来源核对依据见financial_supplement.json；仍需独立数字审计。" if eligible else
+                 "- 归母/少数股东、受限资金、一次性现金流及维持性开支尚未穿透核对。"]
+        lines.extend(f"- ⚠️ {w}" for w in warnings)
         return "\n".join(lines)
+
 
     # --- Phase 3: §17.10-17.13 pre-computation grids ---
     # Design invariant: G does NOT enter R/GG (因子2基准=C 报表利润, 因子3基准=AA).
@@ -1309,7 +1092,7 @@ class DerivedMetricsMixin:
     def _mean_first3(lookup: dict, years: list) -> float | None:
         """Mean of a {year: value} lookup over the first up-to-3 of the given years."""
         vals = [lookup[y] for y in years[:3] if y in lookup]
-        return sum(vals) / len(vals) if vals else None
+        return sum(vals) / 3 if len(vals) == 3 else None
 
     def _compute_payout_crosscheck(self) -> str | None:
         """Compute §17.10: M (payout ratio) three-method cross-check + recommendation.
@@ -1318,10 +1101,8 @@ class DerivedMetricsMixin:
         法2 §5 逐年 c_pay_dist_dpcp_int_exp / 归母净利润（含利息及少数股东股利，系上界）
         法3 §17.1 payout 口径（_get_payout_by_year）
 
-        Recommendation (Python):
-          三种方法 3 年均值两两相对偏差 > 15% → M_rec=法2 + warning
-          A股逐年 DPS 在 ≥3 年完全相同 → 填充错误 warning + M_rec=法2
-          否则 → M_rec=法3
+        Recommendation: complete-FY shareholder distributions (法3), else
+        complete-FY DPS/EPS (法1, approximate). 法2 is diagnostic only.
 
         Stores self._store["payout_crosscheck"]. Returns None only if all methods lack data.
         """
@@ -1339,16 +1120,13 @@ class DerivedMetricsMixin:
 
         # --- 法1: DPS / EPS ---
         m1_by_year = {}
-        dps_by_year = {}
+        from financial_contracts import annual_dividends
+        dps_by_year = {r["year"]: r["dps"] for r in annual_dividends(
+            self._store.get("dividends_all", self._store.get("dividends")), self._store.get("as_of"))}
         currency_note = False
         div_df = self._store.get("dividends")
         hk_df = self._store.get("dividends_hk")
         if div_df is not None and not div_df.empty:
-            for _, r in div_df.iterrows():
-                y = str(r.get("end_date", ""))[:4]
-                v = self._safe_float(r.get("cash_div_tax"))
-                if v is not None:
-                    dps_by_year[y] = dps_by_year.get(y, 0.0) + v
             for y, dps in dps_by_year.items():
                 eps = eps_by_year.get(y)
                 if eps and eps > 0:
@@ -1407,24 +1185,19 @@ class DerivedMetricsMixin:
         def _pick(label):
             return {"法1": m1, "法2": m2, "法3": m3}.get(label)
 
-        if max_dev > 0.15 and m2 is not None:
-            m_rec_label = "法2"
-            reason = (f"三种方法3年均值两两相对偏差最大 {max_dev * 100:.1f}%"
-                      f"（{max_pair[0]} vs {max_pair[1]}）> 15%，采用法2（现金流最可靠）")
-            warnings.append(reason)
-        elif identical_dps and m2 is not None:
-            m_rec_label = "法2"
-            reason = "A股逐年 DPS 在 ≥3 年完全相同，高度疑似 Tushare 数据填充错误，采用法2"
-            warnings.append(reason)
-        elif m3 is not None:
+        if max_dev > 0.15:
+            warnings.append("现金流分配项含利息/少数股东股利且属支付年度，只能提示差异，不可替代归母分红。")
+        if identical_dps:
+            warnings.append("连续年度DPS相同可能是分红政策，不据此判定填充错误。")
+        if m3 is not None:
             m_rec_label = "法3"
-            reason = "三法一致（偏差 ≤ 15%），采用法3（§17.1 同币种口径）"
-        elif m2 is not None:
-            m_rec_label = "法2"
-            reason = "法3 不可用，回退至法2（现金流口径）"
-        else:
+            reason = "完整分红年度、按各次股本计算归母现金分红总额/同期归母净利润"
+        elif m1 is not None:
             m_rec_label = "法1"
-            reason = "仅法1可用"
+            reason = "仅完整年度DPS/EPS可用（股本变化时为近似值）"
+        else:
+            m_rec_label = "未核实"
+            reason = "归母分红未核实；禁止用含利息的分配现金替代"
         m_rec = _pick(m_rec_label)
 
         if currency_note:
@@ -1438,7 +1211,7 @@ class DerivedMetricsMixin:
 
         # --- Build output ---
         lines = [format_header(3, "17.10 支付率 M 三重校验"), ""]
-        lines.append("> 法2 含利息及少数股东股利，系支付率上界；法3 为 §17.1 同币种口径。"
+        lines.append("> 法2含利息、少数股东股利且按支付年度，与财政年度支付率不可直接比；法3为归母口径。"
                      "推荐规则已在 Python 内裁定，LLM 直接引用 M_rec。")
         lines.append("")
 
@@ -1505,7 +1278,8 @@ class DerivedMetricsMixin:
         if not raw_ms:
             return None
         if rec_label not in [lab for lab, _ in raw_ms]:
-            rec_label = raw_ms[0][0]
+            return "### 17.11 穿透回报率网格\n\n⚠️ M未核实，不输出回报率与目标价。"
+        raw_ms = [entry for entry in raw_ms if entry[0] != "法2"]
 
         # Reorder recommended first, dedup within 0.5 pct
         ordered = [e for e in raw_ms if e[0] == rec_label] + [e for e in raw_ms if e[0] != rec_label]
@@ -1534,6 +1308,7 @@ class DerivedMetricsMixin:
         o_increment = 100.0 / mkt_cap_mm * 100 if mkt_cap_mm > 0 else 0.0
 
         lines = [format_header(3, "17.11 穿透回报率网格（税后）"), ""]
+        lines.append("> 参考情景，非投资指令。AA默认是合并现金结余代理；仅来源核对归母现金与实际股本均齐备时输出目标价。")
         lines.append(f"> 基准值 C（最新年归母净利润）= {format_number(c)} {self._unit_label()}，"
                      f"市值 = {format_number(mkt_cap)} {self._unit_label()}，"
                      f"当前股价 = {close:.2f} {self._price_unit()}，"
@@ -1582,7 +1357,10 @@ class DerivedMetricsMixin:
                 row.append(f"{hh:+.2f}")
                 row.append(f"{(gg_default - ii):+.2f}")
                 tbp = close * gg_default / ii if ii > 0 else 0.0
-                row.append(f"{tbp:.2f}")
+                basic = self._store.get("basic_info", pd.DataFrame())
+                shares_verified = not basic.empty and str(basic.iloc[0].get("shares_verified", False)).lower() == "true"
+                eligible = f3s.get("decision_eligible", False) and shares_verified
+                row.append(f"{tbp:.2f}" if tbp > 0 and eligible else "—（未完成穿透/无正买点）")
                 rows_b.append(row)
         lines.append(format_table(headers_b, rows_b,
                                   alignments=["l"] + ["r"] * (len(q_rates) + 3)))
@@ -1608,14 +1386,9 @@ class DerivedMetricsMixin:
             return None
 
         latest_cf = cf_df.iloc[0]
-        da = 0.0
-        any_da = False
-        for col in ["depr_fa_coga_dpba", "amort_intang_assets", "lt_amort_deferred_exp"]:
-            v = self._safe_float(latest_cf.get(col))
-            if v is not None:
-                da += v
-                any_da = True
-        if not any_da or da <= 0:
+        from financial_contracts import depreciation
+        da = depreciation(latest_cf)
+        if da is None or da <= 0:
             return None
         d = da
 
@@ -1625,8 +1398,7 @@ class DerivedMetricsMixin:
             dep = self._safe_float(r.get("depr_fa_coga_dpba"))
             ai = self._safe_float(r.get("amort_intang_assets"))
             ad = self._safe_float(r.get("lt_amort_deferred_exp"))
-            comps = [x for x in [dep, ai, ad] if x is not None]
-            day = sum(comps) if comps else None
+            day = depreciation(r)
             cap = self._safe_float(r.get("c_pay_acq_const_fiolta"))
             if day and day > 0 and cap is not None:
                 capex_da_vals.append(abs(cap) / day)
@@ -1720,9 +1492,9 @@ class DerivedMetricsMixin:
                      "其他 M/Q 选择按 M×(1−Q) 比例缩放 GG。")
         lines.append("")
 
-        degraded = lam is None or abs(lam) < 1e-9 or m_prime <= 0
+        degraded = lam is None or abs(lam) < 1e-9 or m_prime <= 0 or lam_reliability != "正常"
         if degraded:
-            reason = ("λ 缺失" if lam is None else
+            reason = ("λ可靠性未通过" if lam_reliability != "正常" else "λ 缺失" if lam is None else
                       ("λ≈0（收入变动不传导至结余）" if abs(lam) < 1e-9 else "m′≤0"))
             lines.append(f"- ⚠️ 降级：{reason}，无法外推收入敏感性。")
             headers = ["收入情景", "结余", "精算回报率 GG", "vs 门槛"]

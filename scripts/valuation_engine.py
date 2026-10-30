@@ -19,6 +19,7 @@ import pandas as pd
 
 from config import validate_stock_code
 from format_utils import format_number, format_table, format_header
+from financial_contracts import annual_dividends, debt, statement_issues, number
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -46,8 +47,8 @@ MARKET_PARAMS = {
 
 # Beta by market cap (百万元)
 BETA_BY_CAP = [
-    (1_000_000, 0.8),   # > 1000亿 (> 1,000,000 百万元)
-    (100_000, 1.0),     # 100-1000亿
+    (100_000, 0.8),     # > 1000亿 (= 100,000 百万元)
+    (10_000, 1.0),      # 100-1000亿
     (0, 1.2),           # < 100亿
 ]
 
@@ -77,6 +78,7 @@ class ValuationEngine:
 
         self.params = MARKET_PARAMS[self.market]
         self._sf = client._safe_float  # shorthand
+        self.unavailable = {}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -127,16 +129,42 @@ class ValuationEngine:
         }
 
     @staticmethod
-    def _cagr(vals: list[float | None]) -> float | None:
+    def _cagr(vals: list[float | None], years=None) -> float | None:
         """Compute CAGR from a desc-ordered list [latest, ..., oldest]."""
-        clean = [v for v in vals if v is not None and v > 0]
-        if len(clean) < 2:
+        if len(vals) < 2:
             return None
-        latest, oldest = clean[0], clean[-1]
-        n = len(clean) - 1
-        if oldest <= 0:
+        latest, oldest = number(vals[0]), number(vals[-1])
+        n = int(str(years[0])[:4]) - int(str(years[-1])[:4]) if years is not None else len(vals) - 1
+        if latest is None or oldest is None or latest <= 0 or oldest <= 0 or n <= 0:
             return None
-        return (latest / oldest) ** (1 / n) - 1
+        return number((latest / oldest) ** (1 / n) - 1)
+
+    def _growth(self, key, col, count=5):
+        frame = self._annual_df(key).head(count)
+        return self._cagr([self._sf(r.get(col)) for _, r in frame.iterrows()],
+                          frame["end_date"].tolist()) if not frame.empty else None
+
+    def _unavailable(self, method, reason):
+        self.unavailable[method] = reason
+        return None
+
+    def _fcff_context(self, method):
+        """Do not mix an unidentified OCF−Capex stream with enterprise WACC."""
+        issues = statement_issues(self.client._store)
+        if issues:
+            self._unavailable(method, "; ".join(issues))
+            return None
+        cf = self._annual_df("cashflow")
+        bs = self._annual_df("balance_sheet")
+        if cf.empty or bs.empty or "fcff" not in cf or not self.client._store.get("fcff_verified", False):
+            self._unavailable(method, "缺少经来源核对的FCFF（须对齐利息、税盾、营运资本与少数股东）；OCF−Capex不自动视为FCFF")
+            return None
+        row = bs.iloc[0]
+        cash, ibd, minority = self._sf(row.get("money_cap")), debt(row), self._sf(row.get("minority_int"))
+        if cash is None or ibd is None or minority is None:
+            self._unavailable(method, "现金/有息债务/少数股东权益缺失，不能从企业价值转换归母股权价值")
+            return None
+        return cash, ibd, minority
 
     def _interest_bearing_debt(self, row) -> float:
         total = 0.0
@@ -162,7 +190,7 @@ class ValuationEngine:
                 v = self._sf(r.get("roe_waa"))
                 if v is not None:
                     roe_vals.append(v)
-        if not roe_vals and not income_df.empty:
+        if not roe_vals and not income_df.empty and not statement_issues(self.client._store):
             bs_df = self._annual_df("balance_sheet")
             if not bs_df.empty:
                 bs_by_year = {str(r["end_date"])[:4]: r for _, r in bs_df.iterrows()}
@@ -182,12 +210,12 @@ class ValuationEngine:
 
         # Revenue CAGR 5yr
         rev_series = [self._sf(r.get("revenue")) for _, r in income_df.head(5).iterrows()]
-        rev_cagr = self._cagr(rev_series)
+        rev_cagr = self._growth("income", "revenue")
         rev_cagr_pct = rev_cagr * 100 if rev_cagr is not None else None
 
         # Net profit CAGR 5yr
         np_series = [self._sf(r.get("n_income_attr_p")) for _, r in income_df.head(5).iterrows()]
-        np_cagr = self._cagr(np_series)
+        np_cagr = self._growth("income", "n_income_attr_p")
         np_cagr_pct = np_cagr * 100 if np_cagr is not None else None
 
         # Score
@@ -317,6 +345,7 @@ class ValuationEngine:
             if tax is not None and pre_tax and pre_tax > 0:
                 tax_rates.append(tax / pre_tax * 100)
         tax_rate = statistics.mean(tax_rates) if tax_rates else self.params["tax_default"]
+        tax_rate = tax_rate if 0 <= tax_rate <= 100 else self.params["tax_default"]
 
         # WACC
         if d_val <= 0:
@@ -329,6 +358,7 @@ class ValuationEngine:
             "kd_pre": kd_pre, "tax_rate": tax_rate,
             "e_weight": e_weight, "d_weight": d_weight,
             "wacc": wacc,
+            "status": "参考假设，非实测融资成本；净财务费用含利息收入/汇兑，Kd仅近似",
             "mkt_cap_mm": mkt_cap_mm,
             "debt_mm": d_val,
             "e_val": e_val, "d_val": d_val,
@@ -343,6 +373,10 @@ class ValuationEngine:
         cf_df = self._annual_df("cashflow")
         bi = self._basic_info()
         bs_df = self._annual_df("balance_sheet")
+        context = self._fcff_context("DCF")
+        if context is None:
+            return None
+        cash, debt_raw, minority = context
 
         if cf_df.empty or not bi.get("total_shares"):
             return None
@@ -353,31 +387,32 @@ class ValuationEngine:
         # FCF series
         fcf_list = []
         for _, r in cf_df.head(5).iterrows():
-            ocf = self._sf(r.get("n_cashflow_act"))
-            capex = self._sf(r.get("c_pay_acq_const_fiolta"))
-            if ocf is not None and capex is not None:
-                fcf_list.append(ocf - abs(capex))
+            fcf_list.append(self._sf(r.get("fcff")))
 
-        if len(fcf_list) < 2:
-            return None
+        if len(fcf_list) < 3 or any(v is None for v in fcf_list):
+            return self._unavailable("DCF", "有效FCFF样本不足3年或含缺失年份")
 
         # FCF base (3yr avg, excluding outlier if any)
         base_pool = fcf_list[:3] if len(fcf_list) >= 3 else fcf_list
         fcf_base = statistics.mean(base_pool)
+        if fcf_base <= 0:
+            return self._unavailable("DCF", "FCFF基线非正，稳定永续模型不适用")
         all_negative = all(f <= 0 for f in fcf_list)
 
         # Growth assumptions
-        fcf_cagr = self._cagr(fcf_list)
+        fcf_cagr = self._growth("cashflow", "fcff")
         if fcf_cagr is not None and fcf_cagr > 0:
             g_hist = fcf_cagr * 100
         else:
             # Fallback to revenue CAGR
             rev_series = [self._sf(r.get("revenue")) for _, r in self._annual_df("income").head(5).iterrows()]
-            rev_cagr = self._cagr(rev_series)
+            rev_cagr = self._growth("income", "revenue")
             g_hist = rev_cagr * 100 if rev_cagr is not None else 5.0
 
         g_conservative = g_hist * 0.8
         g_terminal = self.params["g_terminal"]
+        if wacc <= 0 or g_conservative <= -100:
+            return self._unavailable("DCF", "折现率或增长假设无效")
 
         # Ensure g_terminal < WACC
         if g_terminal >= wacc:
@@ -404,11 +439,9 @@ class ValuationEngine:
         tv_pct = pv_tv / ev * 100 if ev > 0 else 0
 
         # Cash and debt
-        cash = self._sf(bs_df.iloc[0].get("money_cap")) if not bs_df.empty else 0
-        cash = cash or 0
-        debt_raw = self._interest_bearing_debt(bs_df.iloc[0]) if not bs_df.empty else 0
-
-        equity_value = ev + cash - debt_raw
+        equity_value = ev + cash - debt_raw - minority
+        if equity_value <= 0:
+            return self._unavailable("DCF", "归母股权价值非正，不输出负目标价")
         intrinsic = equity_value / total_shares if total_shares > 0 else 0
 
         # Sensitivity matrix 5x5
@@ -418,7 +451,7 @@ class ValuationEngine:
         for w in wacc_range:
             row = []
             for g in g_range:
-                if g >= w:
+                if g >= w or w <= 0 or g <= -100:
                     row.append(None)
                     continue
                 # Simplified: re-project with same cash flows but different TV
@@ -426,8 +459,8 @@ class ValuationEngine:
                 pv_fcf_s = sum(f / (1 + w / 100) ** (i + 1) for i, f in enumerate(projected))
                 pv_tv_s = tv_s / (1 + w / 100) ** 5
                 ev_s = pv_fcf_s + pv_tv_s
-                eq_s = ev_s + cash - debt_raw
-                row.append(eq_s / total_shares if total_shares > 0 else 0)
+                eq_s = ev_s + cash - debt_raw - minority
+                row.append(eq_s / total_shares if eq_s > 0 else None)
             sensitivity.append(row)
 
         return {
@@ -461,6 +494,10 @@ class ValuationEngine:
         income_df = self._annual_df("income")
         bi = self._basic_info()
         bs_df = self._annual_df("balance_sheet")
+        context = self._fcff_context("DCF_Scenarios")
+        if context is None:
+            return None
+        cash, debt_raw, minority = context
 
         if cf_df.empty or income_df.empty or not bi.get("total_shares"):
             return None
@@ -473,30 +510,23 @@ class ValuationEngine:
 
         # Historical metrics
         rev_series = [self._sf(r.get("revenue")) for _, r in income_df.head(5).iterrows()]
-        rev_cagr = self._cagr(rev_series)
+        rev_cagr = self._growth("income", "revenue")
         rev_cagr_pct = rev_cagr * 100 if rev_cagr is not None else 10.0
 
         # Latest financials
         latest_inc = income_df.iloc[0]
         latest_cf = cf_df.iloc[0]
         revenue = self._sf(latest_inc.get("revenue")) or 0
+        fcff = self._sf(latest_cf.get("fcff"))
+        if revenue <= 0 or fcff is None or fcff <= 0 or wacc <= 0 or rev_cagr is None:
+            return self._unavailable("DCF_Scenarios", "收入/已验证FCFF/增长率/折现率不满足情景模型条件")
         np_val = self._sf(latest_inc.get("n_income_attr_p")) or 0
         net_margin = np_val / revenue * 100 if revenue > 0 else 5.0
 
-        ocf = self._sf(latest_cf.get("n_cashflow_act")) or 0
-        capex = abs(self._sf(latest_cf.get("c_pay_acq_const_fiolta")) or 0)
-        capex_rev = capex / revenue if revenue > 0 else 0.05
-
-        da_components = [
-            self._sf(latest_cf.get("depr_fa_coga_dpba")) or 0,
-            self._sf(latest_cf.get("amort_intang_assets")) or 0,
-            self._sf(latest_cf.get("lt_amort_deferred_exp")) or 0,
-        ]
-        da = sum(da_components)
-
-        cash = self._sf(bs_df.iloc[0].get("money_cap")) if not bs_df.empty else 0
-        cash = cash or 0
-        debt_raw = self._interest_bearing_debt(bs_df.iloc[0]) if not bs_df.empty else 0
+        capex = self._sf(latest_cf.get("c_pay_acq_const_fiolta"))
+        if capex is None:
+            return self._unavailable("DCF_Scenarios", "资本支出缺失，不能按0建立情景")
+        capex_rev = abs(capex) / revenue
 
         def _project_scenario(rev_g_factors, margin_adj, capex_factor):
             projected = []
@@ -504,10 +534,10 @@ class ValuationEngine:
             for i in range(5):
                 g = rev_g_factors[i] if i < len(rev_g_factors) else rev_g_factors[-1]
                 rev = rev * (1 + g / 100)
-                margin = net_margin + margin_adj * (i + 1)
-                np_s = rev * margin / 100
-                capex_s = rev * capex_rev * capex_factor
-                fcf_s = np_s + da - capex_s
+                # Explicit FCFF-margin scenario. Includes working-capital,
+                # tax/interest treatment embedded in the verified base FCFF.
+                margin = fcff / revenue + margin_adj / 100 * (i + 1)
+                fcf_s = rev * margin - rev * capex_rev * (capex_factor - 1)
                 projected.append(fcf_s)
             return projected
 
@@ -531,7 +561,7 @@ class ValuationEngine:
             pv_fcf = sum(f / (1 + wacc / 100) ** (i + 1) for i, f in enumerate(projected_fcf))
             pv_tv = tv / (1 + wacc / 100) ** 5
             ev = pv_fcf + pv_tv
-            eq = ev + cash - debt_raw
+            eq = ev + cash - debt_raw - minority
             return eq / total_shares if total_shares > 0 else 0
 
         v_opt = _dcf_value(opt_fcf)
@@ -539,6 +569,8 @@ class ValuationEngine:
         v_pess = _dcf_value(pess_fcf)
 
         weighted = 0.25 * v_opt + 0.50 * v_base + 0.25 * v_pess
+        if min(v_opt, v_base, v_pess) <= 0:
+            return self._unavailable("DCF_Scenarios", "存在非正股权价值情景，不生成概率加权买点")
 
         return {
             "method": "DCF_Scenarios",
@@ -560,66 +592,24 @@ class ValuationEngine:
     # ------------------------------------------------------------------
 
     def _aggregate_annual_dps(self) -> list[tuple[str, float]]:
-        """Aggregate DPS by fiscal year, summing interim + final dividends.
+        """Complete implemented fiscal years only; never backfill from CF."""
+        store = self.client._store
+        rows = annual_dividends(store.get("dividends_all", store.get("dividends")), store.get("as_of"))
+        return [(r["year"], r["dps"]) for r in rows[:5]]
 
-        Returns list of (year, total_dps) sorted desc by year.
-        Also cross-validates against cash flow dividends paid (§5).
-        """
-        div_df = self.client._store.get("dividends")
-        if div_df is None or div_df.empty:
-            return []
-
-        # Sum cash_div_tax per fiscal year
-        yearly = {}
-        for _, r in div_df.iterrows():
-            year = str(r.get("end_date", ""))[:4]
-            if not year:
-                continue
-            dps = self._sf(r.get("cash_div_tax")) or 0
-            yearly[year] = yearly.get(year, 0) + dps
-
-        # Cross-validate against §5 dividends paid; fix incomplete years
-        cf_df = self._annual_df("cashflow")
-        bi = self._basic_info()
-        total_shares = bi.get("total_shares")
-        if not cf_df.empty and total_shares and total_shares > 0:
-            cf_by_year = {str(r["end_date"])[:4]: r for _, r in cf_df.iterrows()}
-            for year in list(yearly.keys()):
-                cf_row = cf_by_year.get(year)
-                if cf_row is None:
-                    continue
-                div_paid = self._sf(cf_row.get("c_pay_dist_dpcp_int_exp"))
-                if not div_paid or div_paid <= 0:
-                    continue
-                # Tushare reports div_paid as positive (absolute outflow)
-                dps_total = yearly[year]
-                implied = dps_total * total_shares
-                ratio = implied / div_paid if div_paid > 0 else 0
-                if 0 < ratio < 0.5:
-                    # DPS from dividend API is significantly less than CF shows
-                    # → likely incomplete (interim only). Estimate from CF instead.
-                    dps_from_cf = div_paid / total_shares
-                    print(f"  [DDM fix] {year}: DPS {dps_total:.2f} → {dps_from_cf:.2f} "
-                          f"(corrected from CF dividends_paid)", file=sys.stderr)
-                    yearly[year] = dps_from_cf
-                elif ratio > 2.0:
-                    print(f"  [DDM warning] {year}: DPS×shares={implied/1e6:.0f}M vs "
-                          f"CF={div_paid/1e6:.0f}M (ratio={ratio:.2f})", file=sys.stderr)
-
-        result = sorted(yearly.items(), key=lambda x: x[0], reverse=True)
-        return [(y, v) for y, v in result if v > 0]
-
-    def ddm(self, ke: float) -> dict | None:
+    def ddm(self, ke: float, terminal_growth: float = 0.0) -> dict | None:
         """Dividend Discount Model (Gordon or 2-stage)."""
         income_df = self._annual_df("income")
 
         # Aggregate annual DPS (fixes interim+final double-counting bug)
         annual_dps = self._aggregate_annual_dps()
-        if len(annual_dps) < 3:
-            return None
+        if len(annual_dps) < 3 or ke <= 0 or not -100 < terminal_growth < ke:
+            return self._unavailable("DDM", "完整分红年度不足3年，或Ke/g假设无效")
 
         dps_latest = annual_dps[0][1]
         dps_list = [v for _, v in annual_dps]
+        if any(v <= 0 for v in dps_list[:3]):
+            return self._unavailable("DDM", "最近完整年度存在零/负分红，稳定分红模型不适用")
 
         # Payout ratio stats
         payout_lookup = self.client._get_payout_by_year()
@@ -628,8 +618,10 @@ class ValuationEngine:
         payout_std = statistics.stdev(payout_vals) if len(payout_vals) >= 2 else 0
 
         # DPS CAGR
-        dps_cagr = self._cagr(dps_list)
-        dps_cagr_pct = dps_cagr * 100 if dps_cagr is not None else 2.0
+        dps_cagr = self._cagr(dps_list, [y for y, _ in annual_dps])
+        if dps_cagr is None:
+            return self._unavailable("DDM", "分红增长样本端点无效")
+        dps_cagr_pct = dps_cagr * 100
 
         # ROE for sustainable growth
         fi_df = self._annual_df("fina_indicators")
@@ -639,15 +631,14 @@ class ValuationEngine:
             roe_clean = [v for v in roe_vals if v is not None]
             roe_avg = statistics.mean(roe_clean) if roe_clean else None
 
-        g_terminal = self.params["g_terminal"]
+        g_terminal = terminal_growth
 
         # Model selection
         cv = payout_std / payout_avg if payout_avg and payout_avg > 0 else 0
-        use_gordon = dps_cagr_pct < 5 and cv < 0.20
+        use_gordon = 0 <= dps_cagr_pct < 5 and cv < 0.20
 
         if use_gordon:
-            g_sustainable = roe_avg * (1 - payout_avg / 100) if (roe_avg and payout_avg) else dps_cagr_pct
-            g = min(dps_cagr_pct, g_sustainable)
+            g = terminal_growth  # explicit scenario, NOT historical growth extrapolated forever
             if g >= ke:
                 use_gordon = False  # fallback to 2-stage
 
@@ -658,7 +649,7 @@ class ValuationEngine:
         else:
             # Two-stage
             g1 = dps_cagr_pct
-            g2 = min(g_terminal, ke - 1.0)  # ensure g2 < ke
+            g2 = g_terminal
             pv_phase1 = 0
             dps_t = dps_latest
             for t in range(1, 6):
@@ -677,7 +668,7 @@ class ValuationEngine:
         for k in ke_range:
             row = []
             for gs in g_sens_range:
-                if gs >= k:
+                if k <= 0 or gs <= -100 or (use_gordon and gs >= k) or (not use_gordon and g2 >= k):
                     row.append(None)
                     continue
                 if use_gordon:
@@ -701,6 +692,9 @@ class ValuationEngine:
             "dps_latest": dps_latest,
             "dps_cagr_pct": dps_cagr_pct,
             "g_used": g_used,
+            "g_terminal": terminal_growth,
+            "dividend_year": annual_dps[0][0],
+            "assumptions": "完整年度分红；历史增速仅用于前5年，之后显式终值增速（默认0%）；不是预测或买点",
             "payout_avg": payout_avg,
             "payout_std": payout_std,
             "sensitivity": sensitivity,
@@ -718,7 +712,7 @@ class ValuationEngine:
         wp_df = self.client._store.get("weekly_prices")
         bi = self._basic_info()
 
-        if income_df.empty or wp_df is None or wp_df.empty:
+        if income_df.empty or wp_df is None or wp_df.empty or self.client._store.get("price_basis") != "unadjusted":
             return None
 
         # Build year-end price lookup
@@ -777,7 +771,8 @@ class ValuationEngine:
         high = pe_stats["p75"] * eps_norm
 
         # Current PE percentile
-        current_pe = bi.get("pe_ttm")
+        current_eps = self._sf(income_df.iloc[0].get("basic_eps"))
+        current_pe = bi.get("close") / current_eps if bi.get("close") and current_eps and current_eps > 0 else None
         current_pct = None
         if current_pe and current_pe > 0:
             below = sum(1 for p in pe_series if p <= current_pe)
@@ -810,17 +805,17 @@ class ValuationEngine:
 
         # Earnings growth (3yr CAGR first, fallback to 5yr)
         np_series = [self._sf(r.get("n_income_attr_p")) for _, r in income_df.head(4).iterrows()]
-        g = self._cagr(np_series)
+        g = self._growth("income", "n_income_attr_p", 4)
         if g is None or g <= 0:
             np_series_5 = [self._sf(r.get("n_income_attr_p")) for _, r in income_df.head(5).iterrows()]
-            g = self._cagr(np_series_5)
+            g = self._growth("income", "n_income_attr_p")
         if g is None or g <= 0:
             return None
 
         g_pct = g * 100
         if g_pct > 80:
             np_series_5 = [self._sf(r.get("n_income_attr_p")) for _, r in income_df.head(5).iterrows()]
-            g5 = self._cagr(np_series_5)
+            g5 = self._growth("income", "n_income_attr_p")
             if g5 is not None and g5 > 0:
                 g_pct = g5 * 100
 
@@ -865,6 +860,8 @@ class ValuationEngine:
         income_df = self._annual_df("income")
         wp_df = self.client._store.get("weekly_prices")
         bi = self._basic_info()
+        if statement_issues(self.client._store):
+            return self._unavailable("PS", "三表期间/公告版本未对齐，不拼接收入与历史股本")
 
         if income_df.empty or not bi.get("total_shares") or not bi.get("mkt_cap_mm"):
             return None
@@ -891,18 +888,25 @@ class ValuationEngine:
                         year_end_prices[yr] = close
 
         ps_series = []
+        if self.client._store.get("price_basis") != "unadjusted":
+            return self._unavailable("PS", "历史价格未确认未复权口径")
+        bs = self._annual_df("balance_sheet")
+        shares_by_year = {str(r["end_date"])[:4]: self._sf(r.get("total_shares")) for _, r in bs.iterrows()}
         for _, r in income_df.iterrows():
             yr = str(r["end_date"])[:4]
             rev = self._sf(r.get("revenue"))
-            if rev and rev > 0 and yr in year_end_prices:
-                mc_yr = year_end_prices[yr] * total_shares
+            historical_shares = shares_by_year.get(yr)
+            if rev and rev > 0 and yr in year_end_prices and historical_shares and historical_shares > 0:
+                # Actual historical shares, not monetary paid-in capital:
+                # A-share par value is not universally one yuan per share.
+                mc_yr = year_end_prices[yr] * historical_shares
                 rev_yr = rev
                 ps_yr = mc_yr / rev_yr if rev_yr > 0 else None
                 if ps_yr and ps_yr > 0:
                     ps_series.append(ps_yr)
 
         if len(ps_series) < 3:
-            return None
+            return self._unavailable("PS", "可核实的历史价格/实际股数/收入同期间样本不足3年；不把股本金額当股数")
 
         ps_sorted = sorted(ps_series)
 
@@ -972,7 +976,9 @@ class ValuationEngine:
         fcf_yield = None
         if fcf_base_mm and mkt_cap_mm > 0:
             fcf_yield = fcf_base_mm / mkt_cap_mm * 100
-            implied_g_fcf = wacc - fcf_yield
+            # Yield is descriptive only. An unidentified consolidated cash
+            # stream cannot imply growth in a WACC/enterprise DCF model.
+            implied_g_fcf = None
 
         # --- Method 2: Reverse PE (E/P = Ke - g) ---
         implied_g_earnings = None
@@ -995,8 +1001,7 @@ class ValuationEngine:
         # --- Method 4: Implied WACC (if actual growth is achieved) ---
         actual_fcf_growth = classification.get("np_cagr_pct")  # proxy
         implied_wacc = None
-        if fcf_yield is not None and actual_fcf_growth is not None:
-            implied_wacc = fcf_yield + actual_fcf_growth
+        implied_wacc = None
 
         return {
             "fcf_yield": fcf_yield,
@@ -1020,17 +1025,19 @@ class ValuationEngine:
     def cross_validate(self, results: list[dict], weights: dict) -> dict:
         """Cross-validate results from multiple methods."""
         valid = [(r["method"], r["intrinsic"]) for r in results
-                 if r is not None and r.get("intrinsic") is not None and r["intrinsic"] > 0]
+                 if r is not None and number(r.get("intrinsic")) is not None and r["intrinsic"] > 0]
 
         if not valid:
             return {"weighted_avg": None, "cv": None, "consistency": "N/A", "range": {}}
 
         # Redistribute weights to available methods
         available_methods = {m for m, _ in valid}
-        active_weights = {m: w for m, w in weights.items() if m in available_methods}
+        active_weights = {m: max(0, weights.get(m, 0)) for m in available_methods}
         total_w = sum(active_weights.values())
         if total_w > 0:
             active_weights = {m: w / total_w * 100 for m, w in active_weights.items()}
+        else:
+            active_weights = {m: 100 / len(available_methods) for m in available_methods}
 
         # Weighted average
         weighted_sum = sum(v * active_weights.get(m, 100 / len(valid)) / 100 for m, v in valid)
@@ -1041,7 +1048,9 @@ class ValuationEngine:
         std_v = statistics.stdev(values) if len(values) >= 2 else 0
         cv = std_v / mean_v * 100 if mean_v > 0 else 0
 
-        if cv < 15:
+        if len(valid) < 2:
+            consistency = "单一方法，未形成交叉验证"
+        elif cv < 15:
             consistency = "高"
         elif cv < 30:
             consistency = "中"
@@ -1098,6 +1107,11 @@ class ValuationEngine:
         lines.append(f"*计算时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
         lines.append(f"*计算引擎: valuation_engine.py v1.0*")
         lines.append("")
+        issues = statement_issues(self.client._store)
+        if issues:
+            lines.append("> ⚠️ 三表口径未闭合；下列可运行模型仅为参考情景，不构成已验证分类/评级/买点。")
+            lines.extend(f"- {issue}" for issue in issues)
+            lines.append("")
         lines.append("---")
         lines.append("")
 
@@ -1137,6 +1151,7 @@ class ValuationEngine:
         # --- Section 2: WACC ---
         lines.append(format_header(2, "二、WACC 计算"))
         lines.append("")
+        lines.append("> WACC为市值分档Beta、默认风险溢价/融资成本的参考假设，不是已验证市场回报要求。")
         w = wacc_data
         wacc_rows = [
             ["Rf (无风险利率)", self._fmt_pct(w["rf"]), "§14"],
@@ -1157,6 +1172,7 @@ class ValuationEngine:
         # --- Section 3: Method Details ---
         lines.append(format_header(2, "三、估值方法详情"))
         lines.append("")
+        lines.extend(f"- ⚠️ {name} 不适用：{reason}" for name, reason in self.unavailable.items())
 
         for i, result in enumerate(method_results):
             if result is None:
@@ -1203,6 +1219,8 @@ class ValuationEngine:
                 lines.append(f"- 最新DPS: {result['dps_latest']:.2f}")
                 lines.append(f"- DPS CAGR: {self._fmt_pct(result['dps_cagr_pct'])}")
                 lines.append(f"- 增长率假设: {self._fmt_pct(result['g_used'])}")
+                lines.append(f"- 完整分红年度: {result['dividend_year']}；终值增长: {self._fmt_pct(result['g_terminal'])}")
+                lines.append(f"- 假设边界: {result['assumptions']}")
                 lines.append("")
                 lines.append(f"**内在价值: {self._fmt(result['intrinsic'])} {self._price_unit()}/股**")
                 lines.append("")
@@ -1349,7 +1367,7 @@ class ValuationEngine:
             rv_rows.append([
                 "分红增长 (DDM反解)",
                 self._fmt_pct(ig_d) if ig_d is not None else "—",
-                "DPS 历史高增长（支付率扩张期）",
+                 "最近完整分红年度DPS（非预测）",
                 "—",
             ])
 
@@ -1465,7 +1483,7 @@ class ValuationEngine:
 
         # 5. Reverse valuation
         reverse = self.reverse_valuation(wacc_data, cls)
-        if reverse.get("implied_g_earnings") is not None:
+        if reverse.get("implied_g_earnings") is not None and cls.get("np_cagr_pct") is not None:
             print(f"  反向估值: 市场隐含盈利增长 {reverse['implied_g_earnings']:.1f}% "
                   f"(实际 {cls.get('np_cagr_pct', 0):.1f}%)", file=sys.stderr)
 
@@ -1481,6 +1499,7 @@ def main():
     parser = argparse.ArgumentParser(description="Valuation computation engine")
     parser.add_argument("--code", required=True, help="Stock code (e.g., 600887)")
     parser.add_argument("--output-dir", required=True, help="Output directory")
+    parser.add_argument("--snapshot", help="Use the collector's JSON snapshot (no independent recollection)")
     parser.add_argument(
         "--no-cache",
         action="store_true",
@@ -1493,9 +1512,20 @@ def main():
     # Import AKShareClient here to keep module importable without network for testing
     from akshare_collector import AKShareClient
 
-    print(f"[valuation_engine] 正在采集 {ts_code} 数据 (AKShare)...", file=sys.stderr)
     client = AKShareClient(no_cache=args.no_cache)
-    client.assemble_data_pack(ts_code)
+    snapshot = args.snapshot or os.path.join(args.output_dir, "data_snapshot.json")
+    if os.path.exists(snapshot):
+        print(f"[valuation_engine] 读取同次采集快照: {snapshot}", file=sys.stderr)
+        from data_snapshot import load_snapshot
+        load_snapshot(client, snapshot, ts_code)
+    elif args.snapshot:
+        parser.error(f"快照不存在: {snapshot}")
+    else:
+        # Standalone invocation still works, but also saves its exact inputs.
+        print(f"[valuation_engine] 正在采集 {ts_code} 数据 (AKShare)...", file=sys.stderr)
+        client.assemble_data_pack(ts_code)
+        from data_snapshot import write_snapshot
+        write_snapshot(client, args.output_dir, ts_code)
 
     print(f"[valuation_engine] 正在计算估值...", file=sys.stderr)
     engine = ValuationEngine(ts_code, args.output_dir, client)

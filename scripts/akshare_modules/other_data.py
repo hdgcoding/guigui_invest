@@ -238,5 +238,10 @@ class OtherDataMixin:
 
     def get_audit(self, ts_code: str) -> str:
         """Audit opinion placeholder — best filled by Agent WebSearch."""
+        evidence = self._store.get("audit_evidence")
+        if evidence:
+            return (format_header(3, "7B. 审计意见") +
+                    f"\n\n{evidence['end_date']}：{evidence['opinion']}；{evidence['source']}；{evidence['locator']}\n"
+                    "\n*此项是财报审计意见，不等于本分析报告的数字审计PASS。*\n")
         return (format_header(3, "7B. 审计意见")
-                + "\n\n*[审计意见待Agent WebSearch补充 (最新年报审计意见类型)]*\n")
+                + "\n\n审计状态：未核实（不等于通过）。须以最新年报/审计报告标明意见类型、年度、来源与页码；不能因接口缺失跳过后宣称无审计风险。\n")

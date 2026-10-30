@@ -24,6 +24,8 @@ import argparse
 import os
 import re
 import sys
+import json
+import hashlib
 from typing import Dict, List, Optional, Tuple
 
 WINDOW = 30
@@ -87,7 +89,19 @@ def _classify(window: str, num_offset: int) -> Optional[Tuple[str, str]]:
                 idx = hay.find(kw, start)
                 if idx < 0:
                     break
-                dist = abs(idx - num_offset)
+                # A metric must immediately label this value, not occur in a
+                # neighbouring table cell/sentence (发电量 is not 净利润).
+                if idx >= num_offset:
+                    start = idx + 1
+                    continue
+                bridge = window[idx + len(kw):num_offset]
+                if len(bridge) > 10 or re.search(r"[|；;。\n%％]|\d", bridge):
+                    start = idx + 1
+                    continue
+                if any(token in bridge for token in ("同比", "增长", "下降", "增速", "变化")):
+                    start = idx + 1
+                    continue
+                dist = len(bridge)
                 if best is None or dist < best[0]:
                     best = (dist, canon, kind)
                 start = idx + 1
@@ -191,8 +205,22 @@ def _cjk_count(s: str) -> int:
     return sum(1 for ch in s if "一" <= ch <= "鿿")
 
 
-def check_gates(text: str) -> List[str]:
+def check_gates(text: str, report_type: str = "qualitative", metrics=None) -> List[str]:
     failures = []
+    if report_type == "auto":
+        report_type = "qualitative" if "维度一" in text else "valuation" if "估值报告" in text.splitlines()[0] else "turtle"
+    if "🎯 投资决策卡" not in text[:2000]:
+        failures.append("第一屏缺少投资决策卡")
+    if report_type != "qualitative":
+        for name in ("执行摘要", "数字溯源汇总", "结构化参数", "分析边界"):
+            if name not in text:
+                failures.append(f"缺少章节「{name}」")
+        if not re.search(r"(?:分析|复核)日期[：:]\s*\d{4}-\d{2}-\d{2}", text):
+            failures.append("缺少分析/复核日期")
+        if re.search(r"(?:买入就是胜利|买入必胜|保证本金)", text):
+            failures.append("包含保证式投资表述")
+        failures.extend(check_decision_card(text, metrics))
+        return failures
     for name, minimum in DIMENSION_MINS:
         body = _section_body(text, name)
         if body is None:
@@ -208,6 +236,38 @@ def check_gates(text: str) -> List[str]:
     for header in REQUIRED_SECTIONS:
         if header not in text:
             failures.append(f"缺少必备章节标题「{header}」")
+    failures.extend(check_decision_card(text, metrics))
+    return failures
+
+
+def check_decision_card(text, metrics=None):
+    failures = []
+    body = _section_body(text, "投资决策卡")
+    if body is None:
+        return failures
+    for token in "①②③④⑤⑥⑦":
+        if token not in body:
+            failures.append(f"投资决策卡缺少{token}")
+    if metrics is None:
+        if re.search(r"(?:✅|可以买|建议买入|立即买入)", body):
+            failures.append("买入指令没有提供--metrics确定性证据")
+        return failures
+    third = next((line for line in body.splitlines() if "③" in line), "")
+    if metrics.get("status") != "verified" or metrics.get("target_price") is None:
+        if re.search(r"\d+(?:\.\d+)?\s*(?:[–—~～-]\s*\d+(?:\.\d+)?)?\s*元", third):
+            failures.append("未核实模型却在决策卡输出数值买点")
+        if re.search(r"(?:✅|可以买|建议买入|立即买入)", body):
+            failures.append("未核实模型却给出买入指令")
+    else:
+        match = re.search(r"(\d+(?:\.\d+)?)\s*元", third)
+        if not match or abs(float(match[1]) - metrics["target_price"]) > 0.02:
+            failures.append("决策卡买点与确定性target_price不一致")
+    # Explicitly labelled M/R only, not nearby unrelated percentages.
+    for label, key in ((r"(?:支付率\s*M|M)", "payout_pct"), (r"(?:精算穿透回报率|穿透回报率|GG|R)", "penetration_pct")):
+        for match in re.finditer(label + r"\s*[=:：]?\s*\*{0,2}(-?\d+(?:\.\d+)?)%", body):
+            expected = metrics.get(key)
+            if expected is None or abs(float(match[1]) - expected) > 0.02:
+                failures.append(f"决策卡{key}缺少证据或与计算口径不一致")
     return failures
 
 
@@ -249,6 +309,10 @@ def main(argv=None) -> int:
     ap.add_argument("--output", help="consistency_report.md 输出路径（可选）")
     ap.add_argument("--tolerance", type=float, default=0.05, help="同类判定容差（默认 0.05）")
     ap.add_argument("--gates", action="store_true", help="附加执行硬门槛检查（杠杆7）")
+    ap.add_argument("--report-type", choices=("auto", "qualitative", "turtle", "valuation"), default="auto")
+    ap.add_argument("--metrics", help="decision_metrics.json：确定性买点/M/R证据")
+    ap.add_argument("--require-audit", help="numeric_audit产物，必须有独立AUDIT_RESULT: PASS行")
+    ap.add_argument("--require-cleanroom", help="完整流程的独立重算产物，必须含CLEANROOM_DONE")
     args = ap.parse_args(argv)
 
     if not os.path.isfile(args.report):
@@ -261,7 +325,41 @@ def main(argv=None) -> int:
         return 2
 
     conflicts = find_conflicts(extract(text), args.tolerance)
-    gate_failures = check_gates(text) if args.gates else None
+    metrics = None
+    try:
+        if args.metrics:
+            with open(args.metrics, encoding="utf-8") as stream:
+                metrics = json.load(stream)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"[report_consistency] 无法读取metrics: {exc}\n")
+        return 2
+    gate_failures = check_gates(text, args.report_type, metrics) if args.gates else None
+    if args.require_audit:
+        gate_failures = gate_failures or []
+        try:
+            with open(args.require_audit, encoding="utf-8") as stream:
+                audit = stream.read()
+            if not re.search(r"^AUDIT_RESULT:\s*PASS\s*$", audit, re.M):
+                gate_failures.append("numeric_audit未通过，不能交付为完整分析")
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if not re.search(r"^REPORT_SHA256:\s*" + digest + r"\s*$", audit, re.M):
+                gate_failures.append("审计未绑定当前报告SHA256，可能复用了旧报告/其他报告的审计")
+            if args.metrics:
+                with open(args.metrics, "rb") as stream:
+                    metrics_digest = hashlib.sha256(stream.read()).hexdigest()
+                if not re.search(r"^METRICS_SHA256:\s*" + metrics_digest + r"\s*$", audit, re.M):
+                    gate_failures.append("审计未绑定当前decision_metrics.json的SHA256")
+        except OSError:
+            gate_failures.append("numeric_audit产物缺失，不能交付为完整分析")
+    if args.require_cleanroom:
+        gate_failures = gate_failures or []
+        try:
+            with open(args.require_cleanroom, encoding="utf-8") as stream:
+                cleanroom = stream.read()
+            if not re.search(r"^CLEANROOM_DONE\s*$", cleanroom, re.M):
+                gate_failures.append("独立重算产物未完成")
+        except OSError:
+            gate_failures.append("独立重算产物缺失，不能交付为完整流程")
 
     report = render(conflicts, gate_failures, args.tolerance)
     if args.output:
