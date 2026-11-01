@@ -33,7 +33,7 @@ Read strategies/turtle/coordinator.md for the full pipeline specification, then 
   - Reads phase3_quantitative.md (from Agent B) for quantitative parameters
 - Output: output/{code}_{company}/{company}_{code}_分析报告.md
 - 在报告组装前运行 `.venv/bin/python scripts/valuation_engine.py --code $ARGUMENTS --output-dir output/{code}_{company}`，自动使用同目录采集快照。
-- 交付前：单独审计最终策略报告，生成final_audit.md（绑定报告/metrics哈希，不复用BA的audit.md）。运行 `report_consistency.py --report <report> --report-type turtle --gates --metrics <dir>/decision_metrics.json --require-audit <dir>/final_audit.md --require-cleanroom <dir>/cleanroom_metrics.md`；缺审计产物不得宣称完整流程通过。
+- 交付前：单独审计最终策略报告，生成final_audit.md（按 shared/analysis_contract.md 绑定当前报告与 decision_metrics.json 的 SHA256，不复用BA的audit.md）；并把当前哈希机械写入 cleanroom_metrics.md 末尾两行（不改重算表）。运行 `report_consistency.py --report <report> --report-type turtle --gates --metrics <dir>/decision_metrics.json --require-audit <dir>/final_audit.md --require-cleanroom <dir>/cleanroom_metrics.md`；缺审计产物或哈希未绑定当前文件时不得宣称完整流程通过（绑定只证明文件一致，不等于独立审计）。
 
 ## Error Recovery
 - Missing BA outputs → 自动执行 /business-analysis 完整流程后继续；不可跳过审计
@@ -43,6 +43,10 @@ Read strategies/turtle/coordinator.md for the full pipeline specification, then 
 
 ## Output
 Final report: output/{code}_{company}/{company}_{code}_分析报告.md
-Optional HTML (only if requested): `.venv/bin/python scripts/report_to_html.py --input <report>.md --output <report>.html --standalone`
+Optional HTML — **默认不生成**；仅当用户明确要求网页版/打印版/仪表盘时执行：
+```bash
+.venv/bin/python scripts/report_to_html.py --input <report>.md --output <report>.html --standalone
+```
+`report_to_html.py` 已兼容当前分析报告结构：投资决策卡（七项，第一屏）、较上期变化、执行摘要、D1–D6、数字溯源汇总、结构化参数、分析边界；HTML 不入库（可再生，见 AGENTS.md 约定 #10）。
 
 Usage: /turtle-analysis 600887

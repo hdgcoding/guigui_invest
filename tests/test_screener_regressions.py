@@ -67,7 +67,44 @@ def test_missing_goodwill_not_a_zero_risk_ratio(screener):
 def test_screener_aa_window_matches_section17(screener):
     result = screener._extract_factor2_metrics(100000)
     assert result["AA_proxy"] == 19
+    # The consolidated-cash proxy is diagnostic only; it must never be scored
+    # as a penetration return (that would silently dilute the composite).
     assert result["R"] is None
+    assert result["R_status"] == "proxy_unverified"
+    assert result["R_proxy"] == pytest.approx(19 * (45 / 100) / 1000 * 100)  # 0.855%
+    assert "未核实" in result["R_proxy_label"]
+    assert result["R_vs_II"] is None
+
+
+def test_verified_r_uses_reconciled_cash_and_verified_market_cap(screener):
+    store = screener.client._store
+    store["owner_cash_records"] = [
+        {"end_date": "20251231", "owner_surplus_yuan": 20e6},
+        {"end_date": "20241231", "owner_surplus_yuan": 18e6},
+    ]
+    store["basic_info"] = pd.DataFrame([{
+        "ts_code": "600001.SH", "close": 10.0, "total_mv": 120000.0,
+        "shares_verified": True, "trade_date": "20261030"}])
+    result = screener._extract_factor2_metrics(100000)
+    assert result["R_status"] == "verified"
+    # AA=19 (百万元), M=45%, verified market cap=120000万元=1200百万元, A股默认税率0%（持有>1年）
+    assert result["R"] == pytest.approx(19 * (45 / 100) / 1200 * 100)
+    assert result["R_tax_pct"] == 0
+    assert result["R_proxy"] == pytest.approx(0.855)   # proxy keeps the unverified market cap
+    assert result["R_vs_II"] == "below_rf"
+
+
+def test_verified_r_requires_verified_shares(screener):
+    store = screener.client._store
+    store["owner_cash_records"] = [
+        {"end_date": "20251231", "owner_surplus_yuan": 20e6},
+        {"end_date": "20241231", "owner_surplus_yuan": 18e6},
+    ]
+    store["basic_info"] = pd.DataFrame([{
+        "ts_code": "600001.SH", "close": 10.0, "total_mv": 120000.0}])
+    result = screener._extract_factor2_metrics(100000)
+    assert result["R"] is None
+    assert result["R_status"] == "proxy_unverified"
 
 
 def test_dividend_floor_uses_recent_years_not_largest(screener):
@@ -92,7 +129,10 @@ def test_bulk_missing_apis_does_not_crash(screener, monkeypatch):
     for name in ("_fetch_yjbb", "_fetch_listing_dates", "_fetch_fhps_market"):
         monkeypatch.setattr(screener, name, lambda: pd.DataFrame())
     result = screener._tier1_bulk_data()
-    assert "pe_static" in result and "pe_ttm" not in result
+    assert "pe_static" in result and "pe_basis" in result
+    # No EPS/PE source at all → basis is honestly "缺失", never a fake ratio.
+    assert result.iloc[0]["pe_basis"] == "缺失"
+    assert pd.isna(result.iloc[0]["pe"])
     assert screener._tier1_filter(result).empty
     assert any(item["missing"] for item in screener.diagnostics)
 
@@ -134,5 +174,64 @@ def test_cache_refresh_clears_both_caches(screener, monkeypatch):
 def test_missing_pledge_is_unverified_not_a_risk_pass(screener, monkeypatch):
     monkeypatch.setattr(screener, "_bulk_cached", lambda *args: pd.DataFrame())
     not_rejected, _ = screener._check_hard_vetoes("600001.SH")
-    assert not_rejected  # may remain a provisional research candidate, never a buy qualification
-    assert "未核实" in screener._veto_checks["pledge_status"]
+    # May remain a provisional research candidate, never a buy qualification...
+    assert not_rejected
+    assert screener._veto_checks["pledge_status"].startswith("未核实")
+    assert "不等于无质押" in screener._veto_checks["pledge_status"]
+    # ...and the degradation is exported, not silently treated as "no pledge".
+    flags = screener._veto_checks["degraded_flags"].split(";")
+    assert "pledge_unverified" in flags
+    assert "audit_unverified" in flags
+
+
+def test_pledge_fetch_failure_is_flagged(screener, monkeypatch):
+    monkeypatch.setattr(screener, "_bulk_cached", lambda *args: pd.DataFrame())
+    monkeypatch.setattr(screener, "_last_bulk_status", "failed")
+    passed, _ = screener._check_hard_vetoes("600001.SH")
+    assert passed
+    assert "调用失败" in screener._veto_checks["pledge_status"]
+    assert "pledge_unverified" in screener._veto_checks["degraded_flags"].split(";")
+
+
+def test_pledge_above_threshold_is_vetoed(screener, monkeypatch):
+    df = pd.DataFrame({"占总股本比例": [40.0, 40.0], "状态": ["未解押", "未解押"]})
+    monkeypatch.setattr(screener, "_bulk_cached", lambda *args: df)
+    passed, reason = screener._check_hard_vetoes("600001.SH")
+    assert not passed and "pledge_ratio" in reason
+    assert screener._veto_checks["pledge_status"].startswith("已统计未解押明细")
+    assert "pledge_veto" in screener._veto_checks["degraded_flags"].split(";")
+
+
+def test_pledge_uses_unpledged_scope_only(screener, monkeypatch):
+    df = pd.DataFrame({"占总股本比例": [10.0, 90.0], "状态": ["未解押", "已解押"]})
+    monkeypatch.setattr(screener, "_bulk_cached", lambda *args: df)
+    passed, _ = screener._check_hard_vetoes("600001.SH")
+    assert passed
+    assert screener._veto_checks["pledge_ratio"] == pytest.approx(10.0)
+    assert "pledge_unverified" not in screener._veto_checks["degraded_flags"].split(";")
+
+
+def test_degraded_flags_reach_result_row(screener, monkeypatch):
+    monkeypatch.setattr(screener, "_bulk_cached", lambda *args: pd.DataFrame())
+    monkeypatch.setattr(screener, "_populate_store", lambda ts_code: None)
+    monkeypatch.setattr(screener, "_check_financial_quality", lambda channel: (True, {}))
+    monkeypatch.setattr(screener, "_extract_factor2_metrics", lambda mv: {
+        "M": 45.0, "R": None, "R_status": "proxy_unverified", "R_proxy": 0.855})
+    monkeypatch.setattr(screener, "_extract_factor4_metrics", lambda mv: {})
+    monkeypatch.setattr(screener, "_extract_floor_price", lambda close, mv: {})
+    row = pd.Series({"ts_code": "600001.SH", "name": "测试", "close": 10.0,
+                     "total_mv": 100000.0, "pe": 10.0, "pe_basis": "TTM"})
+    result = screener._analyze_single_stock(row)
+    assert "pledge_unverified" in result["degraded_flags"].split(";")
+    assert "audit_unverified" in result["degraded_flags"].split(";")
+    assert "未核实" in result["data_status"]
+
+
+def test_all_released_pledges_are_zero_not_unverified(screener, monkeypatch):
+    df = pd.DataFrame({"占总股本比例": [90.0], "状态": ["已解押"]})
+    monkeypatch.setattr(screener, "_bulk_cached", lambda *args: df)
+    passed, _ = screener._check_hard_vetoes("600001.SH")
+    assert passed
+    assert screener._veto_checks["pledge_ratio"] == 0.0
+    assert "未核实" not in screener._veto_checks["pledge_status"]
+    assert "pledge_unverified" not in screener._veto_checks["degraded_flags"].split(";")

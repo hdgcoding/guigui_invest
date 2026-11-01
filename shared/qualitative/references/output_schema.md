@@ -134,7 +134,7 @@
 下游策略通过读取参数表获取定性结论，不需要解析报告正文。各策略在自己的 interface 文件中定义映射规则，例如：
 
 - **龟龟策略**：`strategies/turtle/references/factor_interface.md` 定义 output_schema → 龟龟因子参数的映射
-- **烟蒂策略**：`strategies/cigarbutt/references/cigarbutt_interface.md` 定义 output_schema → 烟蒂支柱评分的映射
+- **烟蒂策略**：本仓库未移植（上游框架的 `strategies/cigarbutt/` 未包含，本文件不提供对应 interface；如需接入请先移植该策略目录）
 
 ### 版本兼容
 - Schema 版本号：v1.2

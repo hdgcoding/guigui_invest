@@ -12,7 +12,7 @@ echo "=== guigui_invest 初始化 ==="
 
 # 1. 查找 Python >= 3.10
 PYTHON=""
-for cmd in python3.12 python3.11 python3.10 python3; do
+for cmd in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
     if command -v "$cmd" &>/dev/null; then
         if "$cmd" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
             PYTHON="$cmd"
@@ -21,7 +21,7 @@ for cmd in python3.12 python3.11 python3.10 python3; do
     fi
 done
 if [[ -z "$PYTHON" ]]; then
-    echo "❌ 未找到 Python >= 3.10，请先安装"
+    echo "❌ 未找到 Python >= 3.10（支持 3.10–3.14），请先安装"
     exit 1
 fi
 echo "✓ Python: $($PYTHON --version)"
@@ -35,8 +35,9 @@ fi
 # 3. 安装依赖
 if [[ ! -f .venv/.deps_installed ]] || [[ $FORCE_INSTALL -eq 1 ]]; then
     echo "安装依赖 ..."
-    .venv/bin/pip install -q --upgrade pip
-    .venv/bin/pip install -q -r requirements.txt
+    # Use "python -m pip" so a stale/missing pip shim does not break setup.
+    .venv/bin/python -m pip install -q --upgrade pip
+    .venv/bin/python -m pip install -q -r requirements.txt
     touch .venv/.deps_installed
     echo "✓ 依赖已安装"
 else

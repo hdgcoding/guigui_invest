@@ -152,10 +152,9 @@ CACHE_TTL_CATEGORY = {
     "weekly": "market",
     "daily_hist": "market",
     "daily_raw": "market",
+    "daily_hfq": "market",
+    "daily_qfq": "market",
     "valuation": "market",
     "risk_free_rate": "market",
 }
 CACHE_TTL_HOURS = {"financial": 168, "market": 24}
-
-# Never cached (live-ish endpoints)
-NEVER_CACHE = {"repurchase", "pledge_detail"}

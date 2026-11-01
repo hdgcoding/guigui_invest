@@ -217,6 +217,41 @@ def is_garbled(text: str, threshold: float = 0.30) -> bool:
     return ratio < (1 - threshold)
 
 
+def _page_list_label(pages: List[int], max_items: int = 8) -> str:
+    """Compact human-readable page list, e.g. "1, 3, 7-9"."""
+    cleaned = sorted(set(int(p) for p in pages if p is not None))
+    if not cleaned:
+        return "—"
+    ranges: List[Tuple[int, int]] = []
+    start = prev = cleaned[0]
+    for page in cleaned[1:]:
+        if page == prev + 1:
+            prev = page
+            continue
+        ranges.append((start, prev))
+        start = prev = page
+    ranges.append((start, prev))
+    labels = [str(a) if a == b else f"{a}-{b}" for a, b in ranges]
+    if len(labels) > max_items:
+        labels = labels[:max_items] + ["…"]
+    return ", ".join(labels)
+
+
+def _chunk_coverage_label(page_numbers: List[int]) -> str:
+    """Honest per-part coverage label.
+
+    A chunk may be non-contiguous when some pages have no usable text; do not
+    claim a continuous page range in that case.
+    """
+    pages = sorted(set(int(p) for p in page_numbers if p is not None))
+    if not pages:
+        return "本片无正文内容"
+    if pages == list(range(pages[0], pages[-1] + 1)):
+        return f"本片覆盖第 {pages[0]}-{pages[-1]} 页（连续 {len(pages)} 页）"
+    return (f"本片包含第 {pages[0]}-{pages[-1]} 页范围内的 {len(pages)} 页"
+            f"（非连续：{_page_list_label(pages)}；缺页见 manifest.empty_pages）")
+
+
 def _tables_to_markdown(tables: list) -> str:
     """Convert pdfplumber tables to markdown format."""
     parts = []
@@ -243,14 +278,23 @@ def _tables_to_markdown(tables: list) -> str:
     return "\n".join(parts)
 
 
-def extract_all_pages(pdf_path: str, verbose: bool = False) -> List[Tuple[int, str]]:
+def extract_all_pages(pdf_path: str, verbose: bool = False,
+                      meta: Optional[dict] = None) -> List[Tuple[int, str]]:
     """Extract text from all pages of a PDF using pdfplumber.
 
-    Falls back to PyMuPDF if pdfplumber produces garbled text.
+    Falls back to PyMuPDF if pdfplumber produces garbled text. A failure on a
+    single page is recorded and skipped instead of aborting the whole document;
+    callers get the per-page error map and the OCR-candidate page list through
+    ``meta`` so downstream stages cannot mistake a partial extraction for a
+    complete one.
 
     Args:
         pdf_path: Path to the PDF file.
         verbose: Print progress messages.
+        meta: Optional dict populated with extraction provenance:
+            ``extraction_method``, ``page_errors`` (page -> error string),
+            ``garbled_pages``, ``empty_pages``, ``ocr_candidate_pages``,
+            ``pymupdf_used``.
 
     Returns:
         List of (page_number_1indexed, text) tuples.
@@ -261,9 +305,19 @@ def extract_all_pages(pdf_path: str, verbose: bool = False) -> List[Tuple[int, s
     """
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    if meta is None:
+        meta = {}
+    meta.setdefault("extraction_method", "pdfplumber")
+    meta.setdefault("page_errors", {})
+    meta.setdefault("garbled_pages", [])
+    meta.setdefault("empty_pages", [])
+    meta.setdefault("ocr_candidate_pages", [])
+    meta.setdefault("pymupdf_used", False)
 
     pages_text: List[Tuple[int, str]] = []
-    garbled_count = 0
+    garbled_pages: List[int] = []
+    empty_pages: List[int] = []
+    total = 0
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -273,17 +327,31 @@ def extract_all_pages(pdf_path: str, verbose: bool = False) -> List[Tuple[int, s
 
             for i, page in enumerate(pdf.pages):
                 page_num = i + 1
-                text = page.extract_text() or ""
+                try:
+                    text = page.extract_text() or ""
+                except Exception as exc:  # noqa: BLE001 - page-level tolerance
+                    meta["page_errors"][str(page_num)] = f"extract_text: {exc}"
+                    text = ""
 
-                # Feature #45: table-aware extraction
-                tables = page.extract_tables()
-                if tables:
-                    table_md = _tables_to_markdown(tables)
-                    if table_md:
-                        text = text + "\n\n[TABLE]\n" + table_md
+                if text:
+                    # Feature #45: table-aware extraction.
+                    # A table failure must not discard the page text nor abort
+                    # the whole document; record it and keep the plain text.
+                    try:
+                        tables = page.extract_tables()
+                    except Exception as exc:  # noqa: BLE001
+                        tables = None
+                        meta["page_errors"].setdefault(
+                            str(page_num), f"extract_tables: {exc}")
+                    if tables:
+                        table_md = _tables_to_markdown(tables)
+                        if table_md:
+                            text = text + "\n\n[TABLE]\n" + table_md
 
-                if is_garbled(text) and len(text) > 50:
-                    garbled_count += 1
+                if not text or not text.strip():
+                    empty_pages.append(page_num)
+                elif is_garbled(text) and len(text) > 50:
+                    garbled_pages.append(page_num)
 
                 pages_text.append((page_num, text))
 
@@ -296,14 +364,34 @@ def extract_all_pages(pdf_path: str, verbose: bool = False) -> List[Tuple[int, s
             raise RuntimeError(f"PDF is encrypted: {pdf_path}") from e
         raise RuntimeError(f"Cannot open PDF: {pdf_path}: {e}") from e
 
-    # Feature #44: PyMuPDF fallback if >30% pages are garbled
-    if total > 0 and garbled_count / total > 0.30:
+    meta["garbled_pages"] = garbled_pages
+    meta["empty_pages"] = empty_pages
+
+    # Feature #44: PyMuPDF fallback if >30% pages are garbled (or nearly all
+    # pages yield no text at all — scanned documents).
+    zero_text = bool(total) and len(empty_pages) >= max(1, int(total * 0.9))
+    if total and (zero_text or (len(garbled_pages) / total > 0.30)):
         if verbose:
-            print(f"Garbled text detected ({garbled_count}/{total} pages), trying PyMuPDF...")
+            print(f"Garbled/empty text detected ({len(garbled_pages)} garbled, "
+                  f"{len(empty_pages)} empty / {total} pages), trying PyMuPDF...")
         fallback = fallback_extract_pymupdf(pdf_path, verbose=verbose)
         if fallback:
+            fallback = [(pn, text or "") for pn, text in fallback]
+            residual = [pn for pn, text in fallback
+                        if not text.strip() or (is_garbled(text) and len(text) > 50)]
+            meta["extraction_method"] = "pymupdf_fallback"
+            meta["pymupdf_used"] = True
+            meta["ocr_candidate_pages"] = residual
+            meta["empty_pages"] = [pn for pn, text in fallback if not text.strip()]
+            meta["garbled_pages"] = [pn for pn, text in fallback
+                                     if text.strip() and is_garbled(text) and len(text) > 50]
+            if verbose:
+                print(f"  PyMuPDF fallback done; {len(residual)} page(s) still need OCR")
             return fallback
+        if verbose:
+            print("  PyMuPDF fallback unavailable; marking pages as OCR candidates")
 
+    meta["ocr_candidate_pages"] = sorted(set(garbled_pages) | set(empty_pages))
     return pages_text
 
 
@@ -342,8 +430,38 @@ def fallback_extract_pymupdf(pdf_path: str, verbose: bool = False) -> Optional[L
 # Zone detection for A-share annual report structure
 # ---------------------------------------------------------------------------
 
+_CROSS_REF_PREFIXES = ("详见", "参见", "参照", "见第", "详见第")
+
+
+def _heading_positions(text: str, pattern: str) -> List[int]:
+    """Return marker match offsets that look like real headings.
+
+    Inline cross-references such as "详见第三节 管理层讨论与分析" must not
+    switch the report zone, and neither must a marker embedded in the middle
+    of a paragraph. Only matches at the start of a line (allowing leading
+    whitespace) that are not immediately preceded by a cross-reference word
+    are accepted.
+    """
+    positions: List[int] = []
+    for match in re.finditer(pattern, text):
+        start = match.start()
+        line_start = text.rfind("\n", 0, start) + 1
+        prefix = text[line_start:start]
+        if prefix.strip():
+            continue  # not at the beginning of a line
+        before = text[max(0, start - 12):start]
+        if any(word in before for word in _CROSS_REF_PREFIXES):
+            continue
+        positions.append(start)
+    return positions
+
+
 def detect_zones(pages_text: List[Tuple[int, str]]) -> Dict[int, str]:
     """Detect report structure zones by scanning for section markers.
+
+    The earliest heading (by position on the page) wins; cross-references and
+    inline mentions are ignored so that e.g. a financial-report page quoting
+    "详见第三节管理层讨论与分析" is not misclassified as MDA.
 
     Returns:
         Dict mapping page_number -> zone_name. Pages without a detected
@@ -355,10 +473,16 @@ def detect_zones(pages_text: List[Tuple[int, str]]) -> Dict[int, str]:
     for page_num, text in pages_text:
         if not text:
             continue
-        for pattern, zone_name in ZONE_MARKERS:
-            if re.search(pattern, text):
-                zone_transitions.append((page_num, zone_name))
-                break  # first matching marker per page
+        best: Optional[Tuple[int, int, str]] = None  # (position, pattern_idx, zone)
+        for pattern_idx, (pattern, zone_name) in enumerate(ZONE_MARKERS):
+            positions = _heading_positions(text, pattern)
+            if not positions:
+                continue
+            candidate = (positions[0], pattern_idx, zone_name)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+        if best is not None:
+            zone_transitions.append((page_num, best[2]))
 
     if not zone_transitions:
         return {}
@@ -741,6 +865,8 @@ def write_text_exports(pages_text: List[Tuple[int, str]],
     if full_text and not any(text and text.strip() for _, text in pages_text):
         raise RuntimeError("PDF无可用文本（可能为扫描件）；需要OCR或WebSearch补充，不能声称已阅读年报")
 
+    extraction = metadata.get("extraction") or {}
+
     # --- Sections digest ---
     lines = [
         f"# 年报章节提取 — {metadata.get('pdf_file', '')}",
@@ -752,9 +878,17 @@ def write_text_exports(pages_text: List[Tuple[int, str]],
         "> 本文件由 pdf_preprocessor.py 从年报 PDF 提取的**文本**，供 GLM 文本优先阅读。",
         "> 章节上下文为关键词附近截取，并非完整章节。完整文本见同名前缀 _fulltext_part*.md（如已生成）。",
         "",
-        "---",
-        "",
     ]
+    if extraction:
+        ocr_pages = extraction.get("ocr_candidate_pages") or []
+        lines.append(
+            f"> 提取方式: {extraction.get('extraction_method', 'pdfplumber')}"
+            f" · 单页解析失败 {len(extraction.get('page_errors') or {})} 页"
+            f" · 需OCR/外部补充 {len(ocr_pages)} 页"
+            + (f"（第 {_page_list_label(ocr_pages)} 页）" if ocr_pages else "")
+            + "。以上为提取质量提示，不等于这些页已读或已核实。")
+        lines.append("")
+    lines.extend(["---", ""])
     for sid, name in SECTION_NAMES.items():
         lines.append(f"## {sid} · {name}")
         lines.append("")
@@ -794,11 +928,13 @@ def write_text_exports(pages_text: List[Tuple[int, str]],
         manifest = {"source": metadata.get("pdf_file"), "parts": [],
                     "section_candidate_pages": metadata.get("section_candidate_pages", {}),
                     "empty_pages": [pn for pn, text in pages_text if not text or not text.strip()],
+                    "extraction": extraction,
                     "coverage_note": "关键词上下文不是完整章节；扫描页需OCR；生成全文不等于Agent已逐页阅读"}
         for part_no, (content, numbers) in enumerate(chunks, 1):
             path = f"{base}_fulltext_part{part_no}.md"
             header = (f"# 年报全文分片 {part_no}/{len(chunks)}\n\n"
-                      f"*源文件: {metadata.get('pdf_file', '')} · 本片覆盖第 {min(numbers)}-{max(numbers)} 页*\n\n---\n\n")
+                      f"*源文件: {metadata.get('pdf_file', '')} · "
+                      f"{_chunk_coverage_label(numbers)}*\n\n---\n\n")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(header + "".join(content))
             written.append(path)
@@ -873,7 +1009,8 @@ def run_pipeline(pdf_path: str, output_path: str, verbose: bool = False,
 
     # Step 1: Extract all pages
     print(f"[1/4] Extracting pages from {pdf_path}...")
-    pages_text = extract_all_pages(pdf_path, verbose=verbose)
+    extraction_meta: dict = {}
+    pages_text = extract_all_pages(pdf_path, verbose=verbose, meta=extraction_meta)
     total_pages = len(pages_text)
 
     useful_pages = sum(bool(text and text.strip() and not is_garbled(text)) for _, text in pages_text)
@@ -916,8 +1053,12 @@ def run_pipeline(pdf_path: str, output_path: str, verbose: bool = False,
     # Step 4: Write output
     print(f"[4/4] Writing output to {output_path}...")
     result = write_output(contexts, pdf_path, total_pages, output_path)
-    result["metadata"].update({"text_pages": useful_pages, "section_candidate_pages": section_pages,
-                               "coverage_status": "partial" if useful_pages < total_pages else "text_extracted_not_read"})
+    result["metadata"].update({
+        "text_pages": useful_pages,
+        "section_candidate_pages": section_pages,
+        "extraction": extraction_meta,
+        "coverage_status": "partial" if useful_pages < total_pages else "text_extracted_not_read",
+    })
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 

@@ -76,18 +76,18 @@ output/{code}_{company}/  报告 .md + .html
 | TTM 每股股息 + 总股本 | `stock_fhps_em`（东财分红送配，近 5 个报告期聚合） |
 | 上市日期 | `stock_info_sh/sz_name_code`（交易所） |
 
-过滤：排除 ST/PT/退市/银行（可配）→ 上市 ≥3 年 → 市值 ≥5 亿 → 日成交额 ≥0.1 亿（换手率代理）→ 0<PB≤10 → 双通道 PE（主通道 0<PE≤50 + 股息率>0；观察通道亏损股按市值前 50）→ 排名 `0.4×dv + 0.3×(1/PE) + 0.3×(1/PB)`（归一化）取前 150。
+过滤：排除 ST/PT/退市/银行（可配）→ 上市 ≥3 年 → 市值 ≥5 亿 → 日成交额 ≥0.1 亿（换手率代理）→ 0<PB≤10 → 双通道 PE（主通道 0<PE≤50 + 股息率>0；观察通道亏损股按市值前 50）→ 排名 `0.4×dv + 0.3×(1/PE) + 0.3×(1/PB)`（归一化）取前 150。PE 口径：有 TTM 时用 TTM，缺失时回退静态 PE（收盘价 ÷ 最新年报 EPS），结果列 `pe` + `pe_basis` 标明口径，不隐含混用。
 
 **Tier 2 — 深度分析**（逐只，复用 AKShareClient 采集器 + TTL 缓存）：
-- 硬否决：质押比 >70%；审计意见没有稳定自动来源时标“未核实”，不冒充通过
+- 硬否决：质押比 >70%（只统计**未解押**记录）；质押接口失败/缺字段时输出 `degraded_flags`（如 `pledge_unverified`）并标“未核实”，不冒充通过；审计意见没有稳定自动来源时同样标“未核实”
 - 财务质量：ROE ≥8%、毛利率 ≥15%、资产负债率 ≤70%（新浪指标限流时自动从三大报表推导）
-- 因子 2：完整财政年度归母支付率M；现金代理AA_proxy/R_proxy与已核实R分开，未完成归母现金穿透不生成买点
+- 因子 2：完整财政年度归母支付率M；现金代理 AA_proxy/R_proxy 与已核实 R 分开（`R_status`/`R_proxy_label`），未完成归母现金穿透不生成买点
 - 因子 4：EV/EBITDA / FCF 收益率 / 现金调整 PE / 商誉占比
 - 历史参考价：净流动资产/BVPS/10年低点/完整年度股息/悲观FCF；非正和缺失项排除，不足3项不合成；不是保底价
-- 综合评分：ROE 20% + FCF 收益率 20% + 穿透率 R 25% + EV/EBITDA(逆) 15% + 底价溢价(逆) 20%
+- 综合评分：ROE 20% + FCF 收益率 20% + EV/EBITDA(逆) 15% + 底价溢价(逆) 20%（**四因子**）；仅当 R 有核实证据时才加入穿透率 R 25% 并用五因子权重。无核实 R 时剩余权重重归一化（不再把 25% 分摊成 0，输出 `composite_factors`/`composite_r_included` 记录实际口径）
 
-> 注：Tier 1 的 PE 为静态口径（最新年报 EPS），与原版 PE_TTM 略有差异（文档化近似）。
-输出列名为`pe_static`。成交额代理可配`min_daily_amount_yuan`，不冒充真实换手率。非分红股票可使用年报净利润/EPS的加权股本代理进入观察通道，股本来源随结果输出，Tier2需复核。默认导出CSV，HTML仅指定`--html`时生成。
+> 注：Tier 1 的 PE 为 **TTM 优先、静态回退**（静态 = 最新年报 EPS，文档化近似）；输出 `pe` 与 `pe_basis` 两列，不与 TTM 混用。成交额代理可配`min_daily_amount_yuan`，不冒充真实换手率。非分红股票可使用年报净利润/EPS的加权股本代理进入观察通道，股本来源随结果输出，Tier2需复核。默认导出CSV，HTML仅指定`--html`时生成。选股器配置启动时执行 `validate()`：权重和、阈值、TTL 非法会直接报错，不静默生效。
+
 观察通道默认不要求ROE为正（否则亏损股会被全部拒绝）；仍要求现金流、毛利和负债指标合格，可通过`min_roe_obs`显式设置ROE下限。观察候选不等于通过买入资格审查。
 
 ## PDF-first 深度分析（GLM 文本优先）
@@ -122,12 +122,12 @@ output/{code}_{company}/  报告 .md + .html
 .venv/bin/python scripts/akshare_collector.py --code 600887 --no-cache
 
 # 估值引擎（分类 + WACC + DCF/DDM/PE Band + 敏感性表）
-# 自动使用同目录data_snapshot.json；超24小时须先刷新，避免两份数据口径
+# 自动使用同目录data_snapshot.json（校验每帧SHA256；>7天硬过期、>1天告警但可加载）
 .venv/bin/python scripts/valuation_engine.py --code 600887 --output-dir output/600887_伊利股份/
 
 # 选股器（两级筛选）
 .venv/bin/python scripts/screener_core.py --tier1-only              # Tier 1 快速筛选（~1分钟）
-.venv/bin/python scripts/screener_core.py --tier2-limit 30          # 完整流程（限制 Tier 2 数量）
+.venv/bin/python scripts/screener_core.py --tier2-limit 30          # 限制 Tier 2 总数（main/observation 按 150:50 比例分配，观察通道至少 1 只；如 30 → main≈22/obs≈8）
 .venv/bin/python scripts/screener_core.py --min-roe 10 --max-pe 30  # 自定义阈值
 .venv/bin/python scripts/screener_core.py --csv output/s.csv --html output/s.html  # 导出
 .venv/bin/python scripts/screener_core.py --cache-refresh           # 刷新缓存

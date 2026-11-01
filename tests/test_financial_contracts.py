@@ -115,6 +115,67 @@ def test_snapshot_shares_exact_inputs_and_blocks_unverified_buy(financial_client
         load_snapshot(other, tmp_path / "data_snapshot.json", "600900.SH")
 
 
+def test_snapshot_uses_market_trade_date_as_as_of(financial_client, tmp_path):
+    financial_client.compute_derived_metrics("600001.SH")
+    write_snapshot(financial_client, tmp_path, "600001.SH")
+    snapshot = json.loads((tmp_path / "data_snapshot.json").read_text())
+    # as_of 必须是本次行情的 trade_date（分红完整年度判断的截止日）
+    assert snapshot["state"]["as_of"] == "20261030"
+    assert financial_client._store["as_of"] == "20261030"
+    other = type(financial_client)(no_cache=True)
+    load_snapshot(other, tmp_path / "data_snapshot.json", "600001.SH")
+    assert other._store["as_of"] == "20261030"
+
+
+def test_snapshot_sha256_detects_frame_tampering(financial_client, tmp_path):
+    financial_client.compute_derived_metrics("600001.SH")
+    write_snapshot(financial_client, tmp_path, "600001.SH")
+    path = tmp_path / "data_snapshot.json"
+    snapshot = json.loads(path.read_text())
+    snapshot["frames"]["basic_info"][0]["close"] = 99.0
+    path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA256 不匹配"):
+        load_snapshot(type(financial_client)(no_cache=True), path, "600001.SH")
+
+
+def test_snapshot_missing_hash_is_rejected(financial_client, tmp_path):
+    financial_client.compute_derived_metrics("600001.SH")
+    write_snapshot(financial_client, tmp_path, "600001.SH")
+    path = tmp_path / "data_snapshot.json"
+    snapshot = json.loads(path.read_text())
+    snapshot.pop("frame_sha256")
+    path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="哈希校验"):
+        load_snapshot(type(financial_client)(no_cache=True), path, "600001.SH")
+
+
+def _age_snapshot(tmp_path, days):
+    path = tmp_path / "data_snapshot.json"
+    snapshot = json.loads(path.read_text())
+    snapshot["collected_at"] = (pd.Timestamp.now() - pd.Timedelta(days=days)).isoformat()
+    path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_snapshot_older_than_one_day_warns_but_loads(financial_client, tmp_path, capsys):
+    financial_client.compute_derived_metrics("600001.SH")
+    write_snapshot(financial_client, tmp_path, "600001.SH")
+    path = _age_snapshot(tmp_path, 3)
+    other = type(financial_client)(no_cache=True)
+    load_snapshot(other, path, "600001.SH")
+    assert 2 < other._snapshot_age_days < 4
+    assert other._snapshot_warnings and "天" in other._snapshot_warnings[0]
+    assert "快照已" in capsys.readouterr().out
+
+
+def test_snapshot_older_than_seven_days_hard_fails(financial_client, tmp_path):
+    financial_client.compute_derived_metrics("600001.SH")
+    write_snapshot(financial_client, tmp_path, "600001.SH")
+    path = _age_snapshot(tmp_path, 8)
+    with pytest.raises(ValueError, match="硬过期"):
+        load_snapshot(type(financial_client)(no_cache=True), path, "600001.SH")
+
+
 def test_cash_surplus_no_double_counted_wages(financial_client):
     financial_client._store["_true_cash_rev"] = {"2025": 1}
     financial_client._store["_w_total"] = {"2025": 1e99}
@@ -161,3 +222,43 @@ def test_complete_fixture_has_no_silently_swallowed_section17_failure(financial_
     text = financial_client.compute_derived_metrics("600001.SH")
     assert "计算失败" not in text
     assert "17.11" in text and "17.12" in text
+
+
+class TestDebtSchemaSemantics:
+    """Blank debt line items vs missing debt columns are not the same thing."""
+
+    def _row(self, **overrides):
+        row = {"st_borr": 100.0, "lt_borr": 200.0, "bond_payable": None,
+               "non_cur_liab_due_1y": None, "lease_liab": 5.0}
+        row.update(overrides)
+        return row
+
+    def test_blank_line_items_count_as_zero_when_column_exists(self):
+        row = pd.Series(self._row())
+        assert debt(row) == pytest.approx(305.0)
+
+    def test_missing_column_is_unknown_not_zero(self):
+        row = pd.Series({"st_borr": 100.0, "lt_borr": 200.0, "lease_liab": 5.0})
+        assert debt(row) is None
+
+    def test_plain_dict_row_stays_strict(self):
+        assert debt(self._row()) is None  # bond_payable is None → unknown
+
+
+class TestStatementVersionBasis:
+    def test_republished_ann_date_does_not_fake_a_restatement(self, financial_client):
+        store = financial_client._store
+        for key in ("income", "cashflow", "balance_sheet"):
+            store[key]["updated_at"] = "2026-03-30"
+            store[key]["ann_date"] = "2026-03-31"
+        # Later periodic report re-publishes the prior year-end balance sheet.
+        store["balance_sheet"].loc[0, "ann_date"] = "2026-10-24"
+        assert statement_issues(store) == []
+
+    def test_real_content_update_spread_still_flagged(self, financial_client):
+        store = financial_client._store
+        for key in ("income", "cashflow", "balance_sheet"):
+            store[key]["updated_at"] = "2026-03-30"
+        store["balance_sheet"].loc[0, "updated_at"] = "2026-10-24"
+        store["balance_sheet"].loc[0, "ann_date"] = "2026-03-31"
+        assert any("20251231" in issue for issue in statement_issues(store))

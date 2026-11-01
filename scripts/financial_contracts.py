@@ -39,7 +39,31 @@ def strict_sum(row, fields):
 
 
 def debt(row):
-    return strict_sum(row, DEBT_FIELDS)
+    """Interest-bearing debt from one balance-sheet row.
+
+    Semantics differ from ``strict_sum``/``depreciation`` on purpose:
+
+    * a debt column present in the statement schema but blank for this period
+      means the line item was not reported for that period (e.g. no bonds
+      outstanding) and counts as 0 — Chinese statements leave unused liability
+      lines blank rather than printing 0;
+    * a debt column missing from the schema (mapping failure) stays unknown →
+      ``None``, so WACC/DCF fail closed instead of silently using 0;
+    * plain dict rows keep the strict contract (every field required), so tests
+      and callers that don't carry schema context stay conservative.
+    """
+    columns = row.index if isinstance(row, pd.Series) else None
+    total = 0.0
+    for field in DEBT_FIELDS:
+        if columns is not None and field not in columns:
+            return None
+        value = number(row.get(field))
+        if value is None:
+            if columns is None:
+                return None
+            continue  # blank line item = no such balance this period
+        total += value
+    return total
 
 
 def depreciation(row):
@@ -83,16 +107,34 @@ def annual_dividends(plans, as_of=None):
     return sorted(results, key=lambda item: item["year"], reverse=True)
 
 
+def _statement_version(row):
+    """Version date used to align one statement row across statements.
+
+    ``updated_at`` (Sina 更新日期) tracks when the row content last changed;
+    ``ann_date`` (公告日期) can be overwritten when a later periodic report
+    re-publishes the same comparative period, which would otherwise look like a
+    restatement. Use the content-update date first, announcement date only as a
+    fallback. A genuine restatement changes the content date as well, so the
+    >45-day check still fires.
+    """
+    for column in ("updated_at", "ann_date"):
+        date = pd.to_datetime(row.get(column), errors="coerce")
+        if pd.notna(date):
+            return date
+    return None
+
+
 def statement_issues(store):
     """Detect incompatible periods/versions. A mismatch blocks combined models.
 
     Different announcement dates alone need not be a restatement. A >45-day
-    spread for the same annual period requires source reconciliation first.
+    spread for the same annual period (using the content-update date where
+    available, see ``_statement_version``) requires source reconciliation first.
     """
     frames = {key: store.get(key) for key in ("income", "balance_sheet", "cashflow")}
     issues = []
     latest = {}
-    announcements = {}
+    versions = {}
     for key, frame in frames.items():
         if frame is None or frame.empty:
             issues.append(f"{key}: 报表缺失")
@@ -103,15 +145,15 @@ def statement_issues(store):
             continue
         latest[key] = str(annual.iloc[0]["end_date"])
         for _, row in annual.iterrows():
-            date = pd.to_datetime(row.get("ann_date"), errors="coerce")
-            if pd.notna(date):
-                announcements.setdefault(str(row["end_date"]), []).append(date)
+            date = _statement_version(row)
+            if date is not None:
+                versions.setdefault(str(row["end_date"]), []).append(date)
     if len(set(latest.values())) > 1:
         issues.append(f"三表最新年报期间不一致: {latest}")
-    for period, dates in announcements.items():
+    for period, dates in versions.items():
         resolved = store.get("statement_reconciliations", {}).get(period)
         if len(dates) >= 2 and (max(dates) - min(dates)).days > 45 and not resolved:
-            issues.append(f"{period}: 三表公告版本相差超过45天，须核对重述/合并范围")
+            issues.append(f"{period}: 三表版本日期相差超过45天，须核对重述/合并范围")
     return issues
 
 

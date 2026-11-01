@@ -28,6 +28,24 @@ from .constants import (
 class FinancialsMixin:
     """Financial statement methods for AKShareClient."""
 
+    # Critical statement columns: if any of these cannot be mapped, the section
+    # must carry an explicit in-section warning instead of only "数据获取失败".
+    _STATEMENT_CRITICAL = {
+        "利润表": ("revenue", "n_income_attr_p"),
+        "资产负债表": ("total_assets", "total_liab", "total_hldr_eqy_exc_min_int"),
+        "现金流量表": ("n_cashflow_act", "c_pay_acq_const_fiolta"),
+    }
+    _STATEMENT_LABELS = {
+        "利润表": "§3 合并利润表",
+        "资产负债表": "§4 合并资产负债表",
+        "现金流量表": "§5 现金流量表",
+    }
+    _STATEMENT_MAPS = {
+        "利润表": SINA_INCOME_MAP,
+        "资产负债表": SINA_BALANCE_MAP,
+        "现金流量表": SINA_CASHFLOW_MAP,
+    }
+
     # ------------------------------------------------------------------
     # Shared: fetch + normalize a Sina statement
     # ------------------------------------------------------------------
@@ -72,11 +90,14 @@ class FinancialsMixin:
         out["end_date"] = (
             pd.to_datetime(df["报告日"]).dt.strftime("%Y%m%d")
         )
+        missing = []
         for internal, cn in col_map.items():
             if cn in df.columns:
                 out[internal] = pd.to_numeric(df[cn], errors="coerce")
             else:
                 out[internal] = pd.NA
+                missing.append((internal, cn))
+        self._store.setdefault("_field_mapping_misses", {})[symbol] = missing
         for target, source in (("ann_date", "公告日期"), ("updated_at", "更新日期")):
             if source in df:
                 out[target] = pd.to_datetime(df[source].astype(str), errors="coerce").dt.strftime("%Y-%m-%d")
@@ -88,6 +109,33 @@ class FinancialsMixin:
         out = out.sort_values("end_date", ascending=False).reset_index(drop=True)
         return out
 
+    def _mapping_warnings(self, symbol: str) -> list[str]:
+        """In-section warnings when Sina column mapping is incomplete.
+
+        A whole section must not degrade to "数据获取失败" just because one
+        field name changed upstream: keep the mapped values and state exactly
+        which columns were missing.
+        """
+        col_map = self._STATEMENT_MAPS[symbol]
+        misses = self._store.get("_field_mapping_misses", {}).get(symbol) or []
+        if not misses:
+            return []
+        total = len(col_map)
+        hit = total - len(misses)
+        shown = "、".join(cn for _, cn in misses[:8])
+        suffix = f" 等 {len(misses)} 列" if len(misses) > 8 else ""
+        critical = [internal for internal, _ in misses
+                    if internal in self._STATEMENT_CRITICAL[symbol]]
+        lines = []
+        if critical or hit / total < 0.8:
+            lines.append(f"⚠️ [字段映射缺失] {self._STATEMENT_LABELS[symbol]} 字段命中 "
+                         f"{hit}/{total}（{hit / total * 100:.0f}%）；缺失列：{shown}{suffix}。"
+                         "缺失按未知处理，不按 0 填充，也不代表整段不可用。")
+            if critical:
+                lines.append(f"⚠️ 其中关键列缺失：{'、'.join(critical)}；相关指标不可输出。")
+            lines.append("")
+        return lines
+
     # ------------------------------------------------------------------
     # §1 — Basic info
     # ------------------------------------------------------------------
@@ -98,7 +146,11 @@ class FinancialsMixin:
         name, list_date = self._fetch_name_and_list_date(ts_code)
 
         price_df = self._fetch_latest_daily(num)
-        val = self._fetch_valuation(num)
+        # Align the valuation snapshot to the price date: Baidu forward-fills
+        # non-trading days (e.g. Saturday repeats Friday's value), so taking the
+        # global latest date would spuriously disagree with the last close and
+        # silently disable market cap / PE / PB for the whole run.
+        val = self._fetch_valuation(num, price_date=price_df.get("date"))
 
         close = price_df.get("close")
         pe_ttm = val.get("pe_ttm")
@@ -199,18 +251,24 @@ class FinancialsMixin:
                 break
         return name, list_date
 
-    def _fetch_daily(self, num: str) -> pd.DataFrame:
-        """Full unadjusted daily OHLCV from Sina, normalized + cached.
+    def _fetch_daily(self, num: str, adjust: str = "") -> pd.DataFrame:
+        """Full OHLCV from Sina, normalized + cached.
 
-        Returns trade_date/open/high/low/close/vol/amount (vol in 股).
+        ``adjust`` is "" (未复权, default), "hfq" (后复权) or "qfq" (前复权);
+        adjusted series are used for long-horizon price comparisons so that
+        dividends/splits do not distort the history.
         """
+        endpoint = {"": "daily_raw", "hfq": "daily_hfq", "qfq": "daily_qfq"}.get(adjust)
+        if endpoint is None:
+            raise ValueError(f"unsupported adjust: {adjust}")
+
         def _fetch():
             import akshare as ak
             # Determine prefix from code: 6 -> sh, else sz
             pfx = "sh" if num.startswith("6") else "sz"
-            return ak.stock_zh_a_daily(symbol=f"{pfx}{num}", adjust="")
+            return ak.stock_zh_a_daily(symbol=f"{pfx}{num}", adjust=adjust)
 
-        df = self._cached_call("daily_raw", _fetch, key=f"daily_raw:{num}")
+        df = self._cached_call(endpoint, _fetch, key=f"{endpoint}:{num}")
         if df is None or df.empty:
             return pd.DataFrame()
 
@@ -232,8 +290,15 @@ class FinancialsMixin:
         return {"close": self._safe_float(df.iloc[-1]["close"]),
                 "date": str(df.iloc[-1]["trade_date"])}
 
-    def _fetch_valuation(self, num: str) -> dict:
-        """Latest PE-TTM / PB / total market cap from Baidu valuation."""
+    def _fetch_valuation(self, num: str, price_date: str | None = None) -> dict:
+        """PE-TTM / PB / total market cap from Baidu valuation.
+
+        Baidu's series contains forward-filled rows for non-trading days (e.g.
+        Saturday repeats Friday's value). Selecting the global latest date would
+        then disagree with the last close date and disable market cap/PE/PB.
+        When ``price_date`` is provided, use the latest valuation date not after
+        that trading day; otherwise fall back to the latest available date.
+        """
         import akshare as ak
         series = []
         for indicator in ("市盈率(TTM)", "市净率", "总市值"):
@@ -245,7 +310,10 @@ class FinancialsMixin:
             dates = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y%m%d")
             series.append(pd.Series(pd.to_numeric(df["value"], errors="coerce").values, index=dates).groupby(level=0).last())
         common = set(series[0].index) & set(series[1].index) & set(series[2].index)
-        common = [d for d in common if d <= pd.Timestamp.now().strftime("%Y%m%d")]
+        today = pd.Timestamp.now().strftime("%Y%m%d")
+        common = [d for d in common if d <= today]
+        if price_date:
+            common = [d for d in common if d <= str(price_date)]
         if not common:
             return {}
         date = max(common)
@@ -345,7 +413,8 @@ class FinancialsMixin:
             for _, r in df.iterrows():
                 val = r.get(col)
                 if col in ("basic_eps", "diluted_eps"):
-                    row.append(f"{val:.2f}" if val is not None and val == val else "—")
+                    # pd.NA is not comparable (`val == val` raises TypeError).
+                    row.append(self._fmt_fixed(val))
                 else:
                     row.append(format_number(val))
             rows.append(row)
@@ -354,6 +423,7 @@ class FinancialsMixin:
         lines.append("")
         lines.append("*单位: 百万元 (原始数据 / 1,000,000), EPS为元/股; 来源: AKShare 新浪财经*")
         lines.extend(self._statement_metadata(df))
+        lines.extend(self._mapping_warnings("利润表"))
         return "\n".join(lines)
 
     def get_income_parent(self, ts_code: str) -> str:
@@ -419,6 +489,7 @@ class FinancialsMixin:
         lines.append("")
         lines.append("*单位: 百万元; 来源: AKShare 新浪财经*")
         lines.extend(self._statement_metadata(df))
+        lines.extend(self._mapping_warnings("资产负债表"))
         return "\n".join(lines)
 
     def get_balance_sheet_parent(self, ts_code: str) -> str:
@@ -445,8 +516,17 @@ class FinancialsMixin:
         rows = [[label] + [format_number(r.get(field), divider=1 if "eps" in field else 1e6)
                           for _, r in df.iterrows()] for field, label in mapping.items()]
         sources = "; ".join(str(r.get("source", "")) + " " + str(r.get("source_locator", "")) for _, r in df.iterrows())
+        missing = [label for field, label in mapping.items()
+                   if field not in df.columns or df[field].isna().all()]
+        warning = ""
+        if missing:
+            warning = ("\n\n⚠️ [字段映射缺失] 母公司报表缺少字段："
+                       + "、".join(missing[:8])
+                       + (" 等" if len(missing) > 8 else "")
+                       + "；缺失按未知处理，不按 0 填充。")
         return (format_header(2, f"{section}. 母公司{symbol}") + "\n\n" +
-                format_table(["项目(百万元，EPS元/股)"] + labels, rows) + f"\n\n*来源: {sources}*\n")
+                format_table(["项目(百万元，EPS元/股)"] + labels, rows) +
+                f"\n\n*来源: {sources}*" + warning + "\n")
 
     # ------------------------------------------------------------------
     # §5 — Cash flow
@@ -508,6 +588,7 @@ class FinancialsMixin:
         lines.append("*单位: 百万元; FCF = OCF - |Capex|; 来源: AKShare 新浪财经*")
         lines.append("*D&A补充: 东财年度现金流附表，失败回退同花顺；同类折旧字段取一个，不重复加总。缺项保持未知。*")
         lines.extend(self._statement_metadata(df))
+        lines.extend(self._mapping_warnings("现金流量表"))
         return "\n".join(lines)
 
     def _supplement_da(self, ts_code, raw):
@@ -616,7 +697,7 @@ class FinancialsMixin:
         impl = impl.sort_values("end_date", ascending=False)
         # Limit to recent 5 fiscal years (by 报告期 year, 中期+末期同属一个年度)
         impl["_year"] = impl["end_date"].astype(str).str[:4]
-        top_years = impl["_year"].drop_duplicates().head(6).tolist()
+        top_years = impl["_year"].drop_duplicates().head(5).tolist()
         impl = impl[impl["_year"].isin(top_years)].drop(columns=["_year"])
 
         self._store["dividends"] = impl
@@ -651,9 +732,16 @@ class FinancialsMixin:
     # §11 — 10-year weekly prices
     # ------------------------------------------------------------------
 
-    def _fetch_weekly(self, num: str, years: int = 10) -> pd.DataFrame:
-        """Weekly OHLCV resampled from the Sina daily series (qfq)."""
-        df = self._fetch_daily(num)
+    def _fetch_weekly(self, num: str, years: int = 10,
+                      adjust: str = "") -> pd.DataFrame:
+        """Weekly OHLCV resampled from the Sina daily series.
+
+        Default is 未复权 (matches traded prices); pass ``adjust="hfq"`` for the
+        dividend/split-adjusted series used by long-horizon comparisons.
+        """
+        # Keep the legacy single-argument call shape working for tests/tools
+        # that monkeypatch ``_fetch_daily`` with ``lambda num: ...``.
+        df = self._fetch_daily(num) if not adjust else self._fetch_daily(num, adjust=adjust)
         if df.empty:
             return pd.DataFrame()
 
@@ -678,39 +766,62 @@ class FinancialsMixin:
         return weekly[["trade_date", "open", "high", "low", "close", "vol", "amount"]]
 
     def get_weekly_prices(self, ts_code: str) -> str:
-        """Section 11: 10-year weekly summary + annual aggregates."""
+        """Section 11: 10-year weekly summary + annual aggregates.
+
+        Long-horizon statistics use the 后复权 series so dividends/splits do not
+        distort the range; ``weekly_prices`` keeps the 未复权 series because
+        downstream PE/PS use traded prices against same-period EPS/shares.
+        """
         num, _ = split_code(ts_code)
-        df = self._fetch_weekly(num, years=10)
+        raw_weekly = self._fetch_weekly(num, years=10)
+        hfq_weekly = self._fetch_weekly(num, years=10, adjust="hfq")
 
         lines = [format_header(2, "11. 十年周线行情"), ""]
-        if df.empty:
+        if raw_weekly.empty and hfq_weekly.empty:
             lines.append("数据缺失\n")
             return "\n".join(lines)
 
-        self._store["weekly_prices"] = df
+        self._store["weekly_prices"] = raw_weekly
         self._store["price_basis"] = "unadjusted"
+        self._store["weekly_prices_raw"] = raw_weekly
+        if not hfq_weekly.empty:
+            self._store["weekly_prices_hfq"] = hfq_weekly
+            self._store["weekly_prices_basis"] = "hfq"
+            stat_df = hfq_weekly
+        else:
+            stat_df = raw_weekly
+            self._store["weekly_prices_basis"] = "unadjusted"
+            lines.append("⚠️ 后复权周线获取失败：以下10年区间统计改用未复权序列，"
+                         "含除权/除息影响、历史不可比，仅作参考。")
+            lines.append("")
 
-        high_10y = df["high"].max()
-        low_10y = df["low"].min()
-        high_date = df.loc[df["high"].idxmax(), "trade_date"]
-        low_date = df.loc[df["low"].idxmin(), "trade_date"]
-        latest_close = float(df.iloc[-1]["close"])
+        high_10y = stat_df["high"].max()
+        low_10y = stat_df["low"].min()
+        high_date = stat_df.loc[stat_df["high"].idxmax(), "trade_date"]
+        low_date = stat_df.loc[stat_df["low"].idxmin(), "trade_date"]
+        latest_stat = float(stat_df.iloc[-1]["close"])
+        latest_raw = float(raw_weekly.iloc[-1]["close"]) if not raw_weekly.empty else None
+        basis_label = "后复权" if not hfq_weekly.empty else "未复权"
 
         lines.append(format_table(
             ["指标", "数值"],
             [
-                ["10年最高 (元)", f"{high_10y:.2f} ({high_date})"],
-                ["10年最低 (元)", f"{low_10y:.2f} ({low_date})"],
-                ["最新收盘 (元)", f"{latest_close:.2f}"],
-                ["距最高回撤", f"{(1 - latest_close / high_10y) * 100:.1f}%"],
-                ["距最低涨幅", f"{(latest_close / low_10y - 1) * 100:.1f}%"],
+                ["价格口径", f"{basis_label}（10年区间统计；含除权调整，非实际成交价）"
+                 if basis_label == "后复权" else f"{basis_label}（含除权不可比，仅参考）"],
+                [f"10年最高（{basis_label}）", f"{high_10y:.2f} ({high_date})"],
+                [f"10年最低（{basis_label}）", f"{low_10y:.2f} ({low_date})"],
+                ["最新收盘（未复权，实际价）",
+                 f"{latest_raw:.2f}" if latest_raw is not None else "—"],
+                [f"最新收盘（{basis_label}）", f"{latest_stat:.2f}"],
+                ["距最高回撤", f"{(1 - latest_stat / high_10y) * 100:.1f}%"],
+                ["距最低涨幅", f"{(latest_stat / low_10y - 1) * 100:.1f}%"],
             ],
             alignments=["l", "r"],
         ))
         lines.append("")
 
-        # Annual aggregation
-        d = df.copy()
+        # Annual aggregation (same basis as the 10-year statistics above)
+        d = stat_df.copy()
         d["year"] = d["trade_date"].str[:4]
         annual = d.groupby("year").agg(
             high=("high", "max"),
@@ -722,13 +833,15 @@ class FinancialsMixin:
         lines.append(format_header(3, "年度行情汇总"))
         lines.append("")
         lines.append(format_table(
-            ["年度", "最高", "最低", "年末收盘", "周均成交量(股)"],
+            ["年度", f"最高（{basis_label}）", f"最低（{basis_label}）",
+             f"年末收盘（{basis_label}）", "周均成交量(股)"],
             [[r["year"], f"{r['high']:.2f}", f"{r['low']:.2f}",
               f"{r['close']:.2f}", f"{r['avg_vol']:,.0f}"] for _, r in annual.iterrows()],
             alignments=["l", "r", "r", "r", "r"],
         ))
         lines.append("")
-        lines.append("*来源: AKShare 新浪未复权日线重采样周线；不含分红再投资。*")
+        lines.append(f"*来源: AKShare 新浪日线重采样周线；10年/年度区间价格为{basis_label}口径，"
+                     "最新实际收盘为未复权；不代表含分红再投资的账户收益率。*")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -747,9 +860,14 @@ class FinancialsMixin:
 
         out = pd.DataFrame()
         out["end_date"] = pd.to_datetime(df["日期"]).dt.strftime("%Y%m%d")
+        missing = []
         for internal, cn in SINA_FINA_INDICATOR_MAP.items():
-            out[internal] = (pd.to_numeric(df[cn], errors="coerce")
-                             if cn in df.columns else pd.NA)
+            if cn in df.columns:
+                out[internal] = pd.to_numeric(df[cn], errors="coerce")
+            else:
+                out[internal] = pd.NA
+                missing.append(cn)
+        self._store["_fina_indicator_misses"] = missing
         out = out.drop_duplicates(subset=["end_date"])
         return out.sort_values("end_date", ascending=False).reset_index(drop=True)
 
@@ -800,12 +918,22 @@ class FinancialsMixin:
             for label, col in group:
                 row = [label]
                 for _, r in disp.iterrows():
-                    val = r.get(col)
-                    row.append(f"{val:.2f}" if val is not None and val == val else "—")
+                    # _fmt_fixed handles pd.NA/NaN without ambiguous truth values.
+                    row.append(self._fmt_fixed(r.get(col)))
                 rows.append(row)
 
         lines.append(format_table(headers, rows, alignments=["l"] + ["r"] * len(years)))
         lines.append("")
+        misses = self._store.get("_fina_indicator_misses") or []
+        if misses:
+            total = len(SINA_FINA_INDICATOR_MAP)
+            hit = total - len(misses)
+            shown = "、".join(str(c) for c in misses[:8])
+            suffix = f" 等 {len(misses)} 列" if len(misses) > 8 else ""
+            lines.append(f"⚠️ [字段映射缺失] §12 财务指标字段命中 {hit}/{total}"
+                         f"（{hit / total * 100:.0f}%）；缺失列：{shown}{suffix}。"
+                         "关键指标以三表推导补齐，其余按未知处理。")
+            lines.append("")
         lines.append("*来源: AKShare 新浪；缺项按同报告期三表推导。摊薄ROE=归母净利润/期末归母权益；不冒充加权ROE。中期为年初累计，非单季/非年化。*")
         return "\n".join(lines)
 

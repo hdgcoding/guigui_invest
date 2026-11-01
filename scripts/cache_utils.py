@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 import time
 
 import pandas as pd
+
+_PUT_FAILURE_WARNED = False
 
 
 class ScreenerCache:
@@ -45,41 +48,19 @@ class ScreenerCache:
             return None
 
     def put(self, key: str, df: pd.DataFrame) -> None:
-        """Store DataFrame to cache."""
+        """Store DataFrame to cache; write failures warn once on stderr."""
+        global _PUT_FAILURE_WARNED
         path = self._path(key)
         meta_path = self._meta_path(key)
         try:
             df.to_parquet(path, index=False)
             with open(meta_path, "w") as f:
                 f.write(f"{time.time()}\n{key}")
-        except Exception:
-            pass  # cache write failure is non-fatal
-
-    def invalidate(self, key: str) -> None:
-        """Remove a cache entry."""
-        for p in [self._path(key), self._meta_path(key)]:
-            if os.path.exists(p):
-                os.remove(p)
-
-    def invalidate_prefix(self, prefix: str) -> None:
-        """Remove cache entries whose original key starts with prefix."""
-        if not os.path.isdir(self.cache_dir):
-            return
-        for f in os.listdir(self.cache_dir):
-            if not f.endswith(".meta"):
-                continue
-            fp = os.path.join(self.cache_dir, f)
-            try:
-                with open(fp) as fh:
-                    lines = fh.read().strip().split("\n")
-                original_key = lines[1] if len(lines) > 1 else ""
-                if original_key.startswith(prefix):
-                    os.remove(fp)
-                    parquet = fp.replace(".meta", ".parquet")
-                    if os.path.exists(parquet):
-                        os.remove(parquet)
-            except Exception:
-                pass
+        except Exception as exc:  # noqa: BLE001 — cache write failure is non-fatal
+            if not _PUT_FAILURE_WARNED:
+                _PUT_FAILURE_WARNED = True
+                print(f"⚠️ 缓存写入失败（不影响数据采集，后续不再重复提示）: {exc}",
+                      file=sys.stderr)
 
     def clear(self) -> None:
         """Remove all cache entries."""

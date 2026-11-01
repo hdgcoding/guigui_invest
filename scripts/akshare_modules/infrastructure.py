@@ -76,6 +76,16 @@ class InfrastructureMixin:
     # Cached AKShare invocation
     # ------------------------------------------------------------------
 
+    def _record_financial_fetch(self, category: str | None, df) -> None:
+        """Stamp 财务采集时间 only after a real financial fetch returned data.
+
+        Cache hits deliberately do not move this timestamp: the age of the
+        financial statements must come from the actual network collection, not
+        from the time a market refresh ran.
+        """
+        if category == "financial" and df is not None and not df.empty:
+            self._store["_financial_collected_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
     def _cached_call(self, endpoint: str, fetch, key: str | None = None) -> pd.DataFrame:
         """Fetch a DataFrame through the TTL disk cache.
 
@@ -88,7 +98,9 @@ class InfrastructureMixin:
         """
         category = CACHE_TTL_CATEGORY.get(endpoint)
         if self._no_cache or category is None:
-            return self._fetch_with_retry(fetch)
+            df = self._fetch_with_retry(fetch)
+            self._record_financial_fetch(category, df)
+            return df if df is not None else pd.DataFrame()
 
         cache_key = key or endpoint
         ttl = CACHE_TTL_HOURS[category] * 3600
@@ -98,6 +110,7 @@ class InfrastructureMixin:
             return cached
 
         df = self._fetch_with_retry(fetch)
+        self._record_financial_fetch(category, df)
         if df is not None and not df.empty:
             self._cache.put(cache_key, df)
         return df if df is not None else pd.DataFrame()
@@ -206,7 +219,7 @@ class InfrastructureMixin:
 
     @staticmethod
     def _safe_float(val) -> float | None:
-        """Convert a value to float, returning None for NaN/None."""
+        """Convert a value to float, returning None for NaN/None/pd.NA."""
         if val is None:
             return None
         try:
@@ -214,6 +227,15 @@ class InfrastructureMixin:
             return f if math.isfinite(f) else None
         except (TypeError, ValueError):
             return None
+
+    def _fmt_fixed(self, val, decimals: int = 2) -> str:
+        """Format a number with a fixed number of decimals; '—' when missing.
+
+        Unlike ``val == val`` this never raises on ``pd.NA`` (pd.NA is not
+        comparable and would make the boolean context ambiguous).
+        """
+        f = self._safe_float(val)
+        return f"{f:.{decimals}f}" if f is not None else "—"
 
     def _get_annual_df(self, store_key: str) -> pd.DataFrame:
         """Get stored DataFrame filtered to annual periods only (desc)."""

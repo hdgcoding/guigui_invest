@@ -11,6 +11,7 @@
 - 分红按财政年度汇总中期+末期。须有已实施的末期方案、过去的实施日期，且无未实施方案，才算完整年度；前一年也可能未完整。不能把最新单次派息或当年中期当全年。
 - M优先用完整年度、各次分红股本计算的归母分红总额/归母净利润。DPS/EPS为近似交叉检验。现金流“分配股利、利润或偿付利息”含利息/少数股东且属于支付年度，不可替代M、不可反推DPS。DPS连续相同不自动构成错误。
 - D&A按同年度补充，东财同类折旧字段不能重复相加；缺项不按0。营业利润+带符号财务费用+D&A仅为EBITDA近似值。
+- 有息负债=短期借款+长期借款+应付债券+一年内到期非流动负债+租赁负债：来源表中该列存在但本期空白，按“无该项”计0；整列缺失（映射失败）才是未知，WACC/DCF须标不可用。三表版本对齐以`updated_at`（内容更新日期）为基准，`ann_date`可能被后续定期报告对比较数据重新披露覆盖，不能单独据此判定重述。
 - §17.5默认AA是合并OCF−全部Capex的**参考代理**；旧的“营业成本+员工现金”重建可能重复扣减，仅供诊断。归母/少数股东、受限现金、一次性项目未穿透前，不能称为已验证归母可分配现金。
 - 未核对FCFF/FCFE及利息、税盾、营运资本、少数股东时，DCF标“不适用”，不能硬套WACC。负增长Gordon可数学收敛，但不能把周期下降直接当永续事实；DDM显示前5年与终值假设，终值默认0%只是情景，不是预测。
 - 需要恢复母公司表、审计意见、已核对归母现金或FCFF时，使用`shared/financial_supplement_schema.md`定义的来源补充；逐项附原文位置，采集器验证期间/单位和底表一致性。不得靠手改decision_metrics.json把unverified改成verified。
@@ -24,7 +25,7 @@
 - 扫描/乱码/空文本必须标“需OCR/外部来源补充”。现有预处理器不具备OCR；不可重跑文本提取后声称扫描件已解析。
 - 母公司报表只使用明确母公司来源；缺失时年报补充须写报告期、页码、单位。审计意见须有年报或公告来源，缺失为“未核实”，不是通过。
 - clean-room保持独立输入；numeric_audit通过且有实际产物后，才可称“完整流程已完成”。报告类型不同使用相应gates；正则冲突提示是advisory，不可假装完整财务审计。
-- numeric_audit结束前用`shasum -a 256 <report> <decision_metrics.json>`取当前文件哈希，在审计末尾分别写独立行`REPORT_SHA256: <hash>`与`METRICS_SHA256: <hash>`。修改报告/数据后须重新审计；不能复用上期PASS。完整流程同时用`--require-cleanroom <dir>/cleanroom_metrics.md`检查独立重算产物。BA的audit.md不等于最终策略报告的审计；最终策略/估值报告分别生成final_audit.md/valuation_audit.md。
+- numeric_audit结束前用`shasum -a 256 <report> <decision_metrics.json>`取当前文件哈希，在审计末尾分别写独立行`REPORT_SHA256: <hash>`与`METRICS_SHA256: <hash>`。修改报告/数据后须重新审计；不能复用上期PASS。完整流程同时用`--require-cleanroom <dir>/cleanroom_metrics.md`检查独立重算产物：cleanroom文件须含`CLEANROOM_DONE`且`REPORT_SHA256`/`METRICS_SHA256`与当前文件一致（交付前用`shasum`机械重写这两行，不得改动重算表）。哈希绑定只证明产物与当前文件一致，不等于独立审计本身。BA的audit.md不等于最终策略报告的审计；最终策略/估值报告分别生成final_audit.md/valuation_audit.md。
 
 ## 报告与决策卡
 

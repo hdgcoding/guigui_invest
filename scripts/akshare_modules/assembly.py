@@ -31,7 +31,7 @@ class AssemblyMixin:
         ]
         issues = statement_issues(self._store)
         self._store["statement_issues"] = issues
-        for key in ("factor3_sensitivity", "payout_crosscheck", "_true_cash_rev", "_w_total"):
+        for key in ("factor3_sensitivity", "payout_crosscheck"):
             self._store.pop(key, None)
         if issues:
             lines.append("⚠️ 跨表口径未通过校验，暂停§17数值输出（不得据此生成买点）：")
@@ -131,7 +131,27 @@ class AssemblyMixin:
         except Exception:
             return 999
 
-    _REFRESH_SECTIONS = {"1", "2", "11", "14", "17"}
+    _RISK_AGENT_MARKER = "### 13.2 Agent WebSearch 补充"
+    _RISK_STALE_NOTICE = "> 上期 Agent 风险补充（沿用）；须重新核查时效。"
+
+    @classmethod
+    def _merge_agent_risk_section(cls, fresh_text: str, previous_text: str) -> str:
+        """Keep prior §13.2 Agent risk research across a market refresh.
+
+        The deterministic §13.1 warnings are always regenerated from the fresh
+        snapshot; only the Agent-authored 13.2 body is reused with a staleness
+        notice so a refresh can never silently replace it with "待补充".
+        """
+        marker = cls._RISK_AGENT_MARKER
+        if marker not in fresh_text or marker not in previous_text:
+            return fresh_text
+        previous_body = previous_text.split(marker, 1)[1]
+        previous_body = previous_body.replace("*[§13.2 待Agent WebSearch补充]*", "")
+        previous_body = previous_body.replace(cls._RISK_STALE_NOTICE, "").strip()
+        if not previous_body:
+            return fresh_text
+        body = previous_body + "\n\n" + cls._RISK_STALE_NOTICE + "\n"
+        return fresh_text.split(marker, 1)[0] + marker + "\n\n" + body
 
     def refresh_market_sections(self, ts_code: str, existing_content: str) -> str:
         """Rehydrate statements via TTL cache and recompute all dependencies.
@@ -171,8 +191,35 @@ class AssemblyMixin:
                 previous = old[key]
                 archive = previous.split(marker, 1)[1] if marker in previous else previous.split("\n", 1)[-1]
                 text = text.rstrip() + "\n\n" + marker + "\n\n" + archive.strip() + "\n\n"
+            elif key == "13" and key in old:
+                # Regenerate 13.1, preserve the Agent-authored 13.2 research.
+                text = self._merge_agent_risk_section(text, old[key])
             parts.append(text)
         return "".join(parts).rstrip() + footer + "\n"
+
+    def _check_pledge_risk(self, threshold: float = 50.0) -> dict | None:
+        """PLEDGE_RISK warning based on outstanding (未解押) pledges only.
+
+        Summing every historical pledge event double-counts released pledges
+        and repeated rows from the same shareholder, so only unreleased events
+        whose ratio columns are usable feed this check.
+        """
+        from .other_data import unreleased_pledges
+
+        outstanding = self._store.get("pledge_unreleased")
+        if outstanding is None:
+            raw = self._store.get("pledge")
+            outstanding = unreleased_pledges(raw)
+        if outstanding is None or outstanding.empty or "占总股本比例" not in outstanding.columns:
+            return None
+        ratios = pd.to_numeric(outstanding["占总股本比例"], errors="coerce").dropna()
+        if ratios.empty or float(ratios.sum()) <= threshold:
+            return None
+        return {
+            "type": "PLEDGE_RISK",
+            "severity": "高",
+            "message": f"未解押质押股份占总股本比例合计 {ratios.sum():.1f}% 超过 {threshold:g}%",
+        }
 
     # ------------------------------------------------------------------
     # Full assembly
@@ -301,16 +348,16 @@ class AssemblyMixin:
                         "message": f"股票名称含 ST: {nm}",
                     })
 
-            # Pledge ratio check
-            pl_df = self._store.get("pledge")
-            if pl_df is not None and not pl_df.empty and "占总股本比例" in pl_df.columns:
-                ratios = pd.to_numeric(pl_df["占总股本比例"], errors="coerce").dropna()
-                if not ratios.empty and float(ratios.sum()) > 50:
-                    wc.warnings.append({
-                        "type": "PLEDGE_RISK",
-                        "severity": "高",
-                        "message": f"质押股份占总股本比例合计 {ratios.sum():.1f}% 超过 50%",
-                    })
+            # Pledge ratio check — outstanding (未解押) events only, same as §16.
+            if self._store.get("pledge_unverified"):
+                wc.warnings.append({
+                    "type": "PLEDGE_UNVERIFIED",
+                    "severity": "中",
+                    "message": "质押明细接口调用失败，未核实（不等于无质押）；需公告/WebSearch 补充",
+                })
+            pledge_warning = self._check_pledge_risk()
+            if pledge_warning:
+                wc.warnings.append(pledge_warning)
         except Exception:  # noqa: BLE001
             pass  # warnings are best-effort
 
@@ -347,6 +394,13 @@ class AssemblyMixin:
         lines.append(f"*共 {completed}/{len(sections)} 个数据板块成功获取*")
 
         result = "\n".join(lines)
+        # The header is rendered before the statements are fetched; backfill the
+        # real financial collection time so a TTL-cache hit cannot masquerade as
+        # freshly collected financial data.
+        collected_at = self._store.get("_financial_collected_at")
+        if collected_at:
+            result = re.sub(r"\*财务采集时间:[^\n]*\*",
+                            f"*财务采集时间: {collected_at}*", result, count=1)
         if self._supplement_applied:
             from .constants import SINA_INCOME_MAP, SINA_BALANCE_MAP
             header, parts, footer = self._parse_sections(result)

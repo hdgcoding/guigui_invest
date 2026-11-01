@@ -36,7 +36,7 @@ Read strategies/valuation/coordinator.md for the full pipeline specification, th
 - Apply qualitative adjustments: D1 revenue quality → growth rate, D2 moat → terminal growth, D3 cycle → scenario weights, D4 management → governance discount
 - Select adjusted scenarios from sensitivity tables (no arithmetic needed — 查表选行，禁止自算)
 - Output: output/{code}_{company}/{company}_{code}_估值报告.md
-- 最终单独审计估值报告并生成valuation_audit.md，绑定报告/metrics哈希；按valuation类型运行report_consistency.py --gates --metrics <dir>/decision_metrics.json --require-audit <dir>/valuation_audit.md --require-cleanroom <dir>/cleanroom_metrics.md。
+- 最终单独审计估值报告并生成valuation_audit.md，按 shared/analysis_contract.md 绑定当前报告/metrics哈希；把当前哈希机械写入cleanroom_metrics.md末尾两行（不改重算表）。按valuation类型运行report_consistency.py --gates --metrics <dir>/decision_metrics.json --require-audit <dir>/valuation_audit.md --require-cleanroom <dir>/cleanroom_metrics.md；哈希未绑定当前文件的不得视为通过。
 
 ## Error Recovery
 - Missing qualitative_report.md → stop and prompt user to run /business-analysis first

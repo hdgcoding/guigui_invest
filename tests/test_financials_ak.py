@@ -144,3 +144,133 @@ class TestDividendsNormalization:
         md = client.get_dividends("600887.SH")
         assert client._store["dividends"].empty
         assert "暂无已实施分红" in md
+
+
+def _weekly_frame(scale=1.0):
+    return pd.DataFrame({
+        "trade_date": [f"20{16 + i // 2}{6 if i % 2 == 0 else 12:02d}01" for i in range(20)],
+        "open": [10.0 * scale] * 20,
+        "high": [(11.0 + i * 0.1) * scale for i in range(20)],
+        "low": [(9.0 + i * 0.1) * scale for i in range(20)],
+        "close": [(10.0 + i * 0.2) * scale for i in range(20)],
+        "vol": [1e6] * 20,
+        "amount": [1e7] * 20,
+    })
+
+
+class TestDividendDisplayWindow:
+    def test_display_capped_to_five_fiscal_years(self, client, monkeypatch):
+        years = [2025, 2024, 2023, 2022, 2021, 2020, 2019]
+        raw = pd.DataFrame({
+            "报告期": [f"{y}-12-31" for y in years],
+            "现金分红-现金分红比例": [9.0] * len(years),
+            "送转股份-送股比例": [0.0] * len(years),
+            "总股本": [6325365000] * len(years),
+            "方案进度": ["实施分配"] * len(years),
+            "除权除息日": [f"{y + 1}-06-01" for y in years],
+            "现金分红-现金分红比例描述": ["10派9.00元"] * len(years),
+        })
+        monkeypatch.setattr(client, "_fetch_with_retry", lambda fetch: raw)
+        md = client.get_dividends("600887.SH")
+        shown = client._store["dividends"]["end_date"].str[:4].nunique()
+        assert shown == 5
+        # Only the display table is capped; the complete-FY note may list more.
+        assert "20201231" not in md and "20191231" not in md
+        assert "20251231" in md
+
+
+class TestAdjustedWeeklyPrices:
+    def test_hfq_adjust_passed_to_daily(self, client, monkeypatch):
+        captured = {}
+
+        def fake_daily(num, adjust=""):
+            captured["adjust"] = adjust
+            return pd.DataFrame({
+                "trade_date": ["20250103", "20250110"],
+                "open": [1.0 * 2, 2.0 * 2], "high": [2, 4], "low": [1, 2],
+                "close": [2, 4], "vol": [1e6, 1e6], "amount": [1e6, 1e6],
+            })
+
+        monkeypatch.setattr(client, "_fetch_daily", fake_daily)
+        weekly = client._fetch_weekly("600887", years=10, adjust="hfq")
+        assert captured["adjust"] == "hfq"
+        assert len(weekly) >= 1
+
+    def test_weekly_prices_use_hfq_for_stats_but_keep_unadjusted_contract(
+            self, client, monkeypatch):
+        raw = _weekly_frame()
+        hfq = _weekly_frame(scale=2.0)
+
+        def fake_weekly(num, years=10, adjust=""):
+            return hfq if adjust == "hfq" else raw
+
+        monkeypatch.setattr(client, "_fetch_weekly", fake_weekly)
+        md = client.get_weekly_prices("600887.SH")
+        # Downstream PE Band / PS require the unadjusted store contract.
+        assert client._store["weekly_prices"] is raw
+        assert client._store["price_basis"] == "unadjusted"
+        assert client._store["weekly_prices_basis"] == "hfq"
+        assert "weekly_prices_hfq" in client._store
+        assert "后复权" in md
+        assert "最新收盘（未复权，实际价）" in md
+
+    def test_weekly_prices_fallback_labels_unadjusted(self, client, monkeypatch):
+        raw = _weekly_frame()
+
+        def fake_weekly(num, years=10, adjust=""):
+            return pd.DataFrame() if adjust == "hfq" else raw
+
+        monkeypatch.setattr(client, "_fetch_weekly", fake_weekly)
+        md = client.get_weekly_prices("600887.SH")
+        assert "后复权周线获取失败" in md
+        assert client._store["weekly_prices_basis"] == "unadjusted"
+
+
+class TestValuationDateAlignment:
+    """Baidu valuation forward-fills non-trading days (e.g. Saturday = Friday)."""
+
+    @staticmethod
+    def _frames():
+        dates = ["2026-10-29", "2026-10-30", "2026-10-31"]
+        return {
+            "valuation:601088:市盈率(TTM)": pd.DataFrame({"date": dates, "value": [19.24, 19.38, 19.38]}),
+            "valuation:601088:市净率": pd.DataFrame({"date": dates, "value": [2.52, 2.54, 2.54]}),
+            "valuation:601088:总市值": pd.DataFrame({"date": dates, "value": [11196.09, 11276.34, 11276.34]}),
+        }
+
+    def test_aligned_to_price_date_skips_forward_filled_day(self, client, monkeypatch):
+        frames = self._frames()
+        monkeypatch.setattr(client, "_cached_call",
+                            lambda endpoint, fetch, key=None: frames[key])
+        val = client._fetch_valuation("601088", price_date="20261030")
+        assert val["date"] == "20261030"
+        assert round(val["pe_ttm"], 2) == 19.38
+        assert round(val["total_mv_wan"]) == 112_763_400  # 11276.34 亿元 → 万元
+
+    def test_no_history_before_price_date_returns_empty(self, client, monkeypatch):
+        frames = self._frames()
+        monkeypatch.setattr(client, "_cached_call",
+                            lambda endpoint, fetch, key=None: frames[key])
+        # Price date older than every valuation row → cannot align, do not fake it.
+        assert client._fetch_valuation("601088", price_date="20261001") == {}
+
+    def test_basic_info_keeps_market_cap_when_aligned(self, client, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(client, "_fetch_name_and_list_date",
+                            lambda ts_code: ("中国神华", "2007-10-09"))
+        monkeypatch.setattr(client, "_fetch_latest_daily",
+                            lambda num: {"close": 51.99, "date": "20261030"})
+
+        def fake_valuation(num, price_date=None):
+            captured["price_date"] = price_date
+            return {"date": "20261030", "pe_ttm": 19.38, "pb": 2.54,
+                    "total_mv_wan": 112_763_400.0}
+
+        monkeypatch.setattr(client, "_fetch_valuation", fake_valuation)
+        md = client.get_basic_info("601088.SH")
+        info = client._store["basic_info"].iloc[0]
+        assert captured["price_date"] == "20261030"
+        assert info["total_mv"] == pytest.approx(112_763_400.0)
+        assert info["pe_ttm"] == pytest.approx(19.38)
+        assert info["total_share"] == pytest.approx(112_763_400.0 / 51.99, rel=1e-6)
+        assert "总市值 (万元)" in md

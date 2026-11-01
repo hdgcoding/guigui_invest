@@ -96,89 +96,94 @@ class TestWarningsCollector:
         assert wc.warnings == []
 
 
+def _smoke_client():
+    c = AKShareClient()
+    c._no_cache = True
+    c._store = {
+        "basic_info": pd.DataFrame([{
+            "ts_code": "600887.SH", "name": "伊利股份",
+            "trade_date": "20261029", "close": 29.45,
+            "pe_ttm": 18.4, "pb": 3.47,
+            "total_mv": 18628200.0, "circ_mv": 18628200.0,  # 万元
+            "total_share": 632536.5,  # 万股
+        }]),
+        "income": pd.DataFrame({
+            "end_date": ["20251231", "20241231", "20231231", "20221231", "20211231"],
+            "revenue": [115931e6, 115779e6, 126179e6, 123171e6, 110595e6],
+            "oper_cost": [75653e6, 76298e6, 84788e6, 83118e6, 76416e6],
+            "sell_exp": [21544e6, 21982e6, 22571e6, 22908e6, 19314e6],
+            "admin_exp": [4695e6, 4465e6, 5154e6, 5342e6, 4227e6],
+            "rd_exp": [915e6, 869e6, 850e6, 821e6, 601e6],
+            "finance_exp": [-690e6, -591e6, -152e6, -254e6, -29e6],
+            "operate_profit": [13527e6, 10181e6, 11873e6, 10859e6, 10230e6],
+            "total_profit": [12993e6, 10126e6, 11721e6, 10630e6, 10112e6],
+            "income_tax": [1479e6, 1663e6, 1436e6, 1311e6, 1380e6],
+            "n_income": [11513e6, 8463e6, 10284e6, 9318e6, 8732e6],
+            "n_income_attr_p": [11565e6, 8452e6, 10428e6, 9431e6, 8704e6],
+            "minority_gain": [-51e6, 10e6, -144e6, -112e6, 27e6],
+            "basic_eps": [1.83, 1.33, 1.64, 1.48, 1.43],
+        }),
+        "balance_sheet": pd.DataFrame({
+            "end_date": ["20251231", "20241231", "20231231", "20221231", "20211231"],
+            "money_cap": [19494e6, 25404e6, 43371e6, 33853e6, 31742e6],
+            "trad_asset": [3.3e6, 6.1e6, 11.4e6, 30.1e6, 37.2e6],
+            "accounts_receiv": [2987e6, 2878e6, 3084e6, 3088e6, 1958e6],
+            "inventories": [10823e6, 10744e6, 12511e6, 14836e6, 8917e6],
+            "goodwill": [2181e6, 2336e6, 5160e6, 4953e6, 306e6],
+            "total_assets": [152098e6, 153718e6, 151620e6, 130965e6, 101962e6],
+            "st_borr": [45630e6, 36354e6, 39754e6, 26799e6, 12596e6],
+            "lt_borr": [472e6, 4686e6, 11705e6, 9298e6, 5380e6],
+            "bond_payable": [None, None, 3541e6, 3482e6, 3187e6],
+            "non_cur_liab_due_1y": [None, None, None, None, None],
+            "contract_liab": [10564e6, 12072e6, 8695e6, 8912e6, 7891e6],
+            "acct_payable": [11479e6, 12312e6, 13798e6, 15925e6, 13659e6],
+            "total_liab": [93554e6, 96710e6, 94299e6, 76822e6, 53171e6],
+            "total_hldr_eqy_exc_min_int": [54655e6, 53179e6, 53539e6, 50267e6, 47708e6],
+            "minority_int": [3888e6, 3827e6, 3781e6, 3875e6, 1082e6],
+        }),
+        "cashflow": pd.DataFrame({
+            "end_date": ["20251231", "20241231", "20231231", "20221231", "20211231"],
+            "c_recp_sale_goods": [125775e6, 130651e6, 137239e6, 133594e6, 121968e6],
+            "n_cashflow_act": [14343e6, 21739e6, 18290e6, 13420e6, 15527e6],
+            "c_pay_acq_const_fiolta": [3036e6, 3978e6, 6955e6, 6646e6, 6682e6],
+            "c_pay_to_staff": [14188e6, 13861e6, 14252e6, 13974e6, 11044e6],
+            "c_paid_for_taxes": [6854e6, 6729e6, 6821e6, 6008e6, 5075e6],
+            "c_pay_dist_dpcp_int_exp": [12024e6, 9092e6, 8415e6, 7500e6, 5692e6],
+            "n_cash_flows_fnc_act": [-13472e6, -7277e6, 7258e6, 8781e6, 11945e6],
+            "n_cashflow_inv_act": [-7796e6, -32709e6, -16044e6, -19513e6, -7796e6],
+        }),
+        "dividends": pd.DataFrame({
+            "end_date": ["20251231", "20250930", "20241231", "20231231", "20221231"],
+            "cash_div_tax": [0.90, 0.48, 1.22, 1.20, 1.04],
+            "stk_div": [0, 0, 0, 0, 0],
+            "base_share": [632536.5, 632536.5, 636590.0, 636610.0, 639935.0],
+            "div_proc": ["实施"] * 5,
+            "ex_date": ["2026-06-05", "2025-12-17", "2025-06-06", "2024-06-06", "2023-06-06"],
+        }),
+        "weekly_prices": pd.DataFrame({
+            "trade_date": [f"{y}{m:02d}{d:02d}"
+                           for y in range(2016, 2026)
+                           for m, d in [(6, 1), (12, 1)]],
+            "close": [10 + i * 0.4 for i in range(20)],
+            "high": [11 + i * 0.4 for i in range(20)],
+            "low": [9 + i * 0.4 for i in range(20)],
+            "vol": [1e6] * 20,
+        }),
+        "risk_free_rate": pd.DataFrame({
+            "trade_date": ["20261028", "20261027"],
+            "yield": [1.6233, 1.6245],
+        }),
+    }
+    return c
+
+
+@pytest.fixture
+def client():
+    return _smoke_client()
+
+
 class TestDerivedMetricsSmoke:
     """End-to-end §17 computation from a synthetic store (no network)."""
-
-    @pytest.fixture
-    def client(self):
-        c = AKShareClient()
-        c._no_cache = True
-        c._store = {
-            "basic_info": pd.DataFrame([{
-                "ts_code": "600887.SH", "name": "伊利股份",
-                "trade_date": "20261029", "close": 29.45,
-                "pe_ttm": 18.4, "pb": 3.47,
-                "total_mv": 18628200.0, "circ_mv": 18628200.0,  # 万元
-                "total_share": 632536.5,  # 万股
-            }]),
-            "income": pd.DataFrame({
-                "end_date": ["20251231", "20241231", "20231231", "20221231", "20211231"],
-                "revenue": [115931e6, 115779e6, 126179e6, 123171e6, 110595e6],
-                "oper_cost": [75653e6, 76298e6, 84788e6, 83118e6, 76416e6],
-                "sell_exp": [21544e6, 21982e6, 22571e6, 22908e6, 19314e6],
-                "admin_exp": [4695e6, 4465e6, 5154e6, 5342e6, 4227e6],
-                "rd_exp": [915e6, 869e6, 850e6, 821e6, 601e6],
-                "finance_exp": [-690e6, -591e6, -152e6, -254e6, -29e6],
-                "operate_profit": [13527e6, 10181e6, 11873e6, 10859e6, 10230e6],
-                "total_profit": [12993e6, 10126e6, 11721e6, 10630e6, 10112e6],
-                "income_tax": [1479e6, 1663e6, 1436e6, 1311e6, 1380e6],
-                "n_income": [11513e6, 8463e6, 10284e6, 9318e6, 8732e6],
-                "n_income_attr_p": [11565e6, 8452e6, 10428e6, 9431e6, 8704e6],
-                "minority_gain": [-51e6, 10e6, -144e6, -112e6, 27e6],
-                "basic_eps": [1.83, 1.33, 1.64, 1.48, 1.43],
-            }),
-            "balance_sheet": pd.DataFrame({
-                "end_date": ["20251231", "20241231", "20231231", "20221231", "20211231"],
-                "money_cap": [19494e6, 25404e6, 43371e6, 33853e6, 31742e6],
-                "trad_asset": [3.3e6, 6.1e6, 11.4e6, 30.1e6, 37.2e6],
-                "accounts_receiv": [2987e6, 2878e6, 3084e6, 3088e6, 1958e6],
-                "inventories": [10823e6, 10744e6, 12511e6, 14836e6, 8917e6],
-                "goodwill": [2181e6, 2336e6, 5160e6, 4953e6, 306e6],
-                "total_assets": [152098e6, 153718e6, 151620e6, 130965e6, 101962e6],
-                "st_borr": [45630e6, 36354e6, 39754e6, 26799e6, 12596e6],
-                "lt_borr": [472e6, 4686e6, 11705e6, 9298e6, 5380e6],
-                "bond_payable": [None, None, 3541e6, 3482e6, 3187e6],
-                "non_cur_liab_due_1y": [None, None, None, None, None],
-                "contract_liab": [10564e6, 12072e6, 8695e6, 8912e6, 7891e6],
-                "acct_payable": [11479e6, 12312e6, 13798e6, 15925e6, 13659e6],
-                "total_liab": [93554e6, 96710e6, 94299e6, 76822e6, 53171e6],
-                "total_hldr_eqy_exc_min_int": [54655e6, 53179e6, 53539e6, 50267e6, 47708e6],
-                "minority_int": [3888e6, 3827e6, 3781e6, 3875e6, 1082e6],
-            }),
-            "cashflow": pd.DataFrame({
-                "end_date": ["20251231", "20241231", "20231231", "20221231", "20211231"],
-                "c_recp_sale_goods": [125775e6, 130651e6, 137239e6, 133594e6, 121968e6],
-                "n_cashflow_act": [14343e6, 21739e6, 18290e6, 13420e6, 15527e6],
-                "c_pay_acq_const_fiolta": [3036e6, 3978e6, 6955e6, 6646e6, 6682e6],
-                "c_pay_to_staff": [14188e6, 13861e6, 14252e6, 13974e6, 11044e6],
-                "c_paid_for_taxes": [6854e6, 6729e6, 6821e6, 6008e6, 5075e6],
-                "c_pay_dist_dpcp_int_exp": [12024e6, 9092e6, 8415e6, 7500e6, 5692e6],
-                "n_cash_flows_fnc_act": [-13472e6, -7277e6, 7258e6, 8781e6, 11945e6],
-                "n_cashflow_inv_act": [-7796e6, -32709e6, -16044e6, -19513e6, -7796e6],
-            }),
-            "dividends": pd.DataFrame({
-                "end_date": ["20251231", "20250930", "20241231", "20231231", "20221231"],
-                "cash_div_tax": [0.90, 0.48, 1.22, 1.20, 1.04],
-                "stk_div": [0, 0, 0, 0, 0],
-                "base_share": [632536.5, 632536.5, 636590.0, 636610.0, 639935.0],
-                "div_proc": ["实施"] * 5,
-                "ex_date": ["2026-06-05", "2025-12-17", "2025-06-06", "2024-06-06", "2023-06-06"],
-            }),
-            "weekly_prices": pd.DataFrame({
-                "trade_date": [f"{y}{m:02d}{d:02d}"
-                               for y in range(2016, 2026)
-                               for m, d in [(6, 1), (12, 1)]],
-                "close": [10 + i * 0.4 for i in range(20)],
-                "high": [11 + i * 0.4 for i in range(20)],
-                "low": [9 + i * 0.4 for i in range(20)],
-                "vol": [1e6] * 20,
-            }),
-            "risk_free_rate": pd.DataFrame({
-                "trade_date": ["20261028", "20261027"],
-                "yield": [1.6233, 1.6245],
-            }),
-        }
-        return c
 
     def test_full_17_renders(self, client):
         md = client.compute_derived_metrics("600887.SH")
@@ -202,3 +207,132 @@ class TestDerivedMetricsSmoke:
         assert "II（门槛值）" in md
         # A股: max(3.5%, Rf+2%) with Rf=1.62% → 3.62%
         assert "3.62" in md
+
+
+def _make_ev_ready(client):
+    """Fill fields §17.8 needs on the synthetic smoke store."""
+    bs = client._store["balance_sheet"]
+    bs["lease_liab"] = 0.0
+    bs.loc[bs.index[0], "bond_payable"] = 0.0
+    bs.loc[bs.index[0], "non_cur_liab_due_1y"] = 0.0
+    return client
+
+
+class TestDerivedMetricsFixes:
+    """Regression tests for §17.6/§17.8/§17.2/§17.9/§17.10 fixes."""
+
+    def test_17_8_fcf_proxy_is_explicitly_labelled(self, client):
+        _make_ev_ready(client)
+        md = client.compute_derived_metrics("600887.SH")
+        # FY2025 OCF 14343 - |Capex| 3036 = 11307 百万 / 市值 186282 百万 = 6.07%
+        assert "OCF−Capex 合并现金代理" in md
+        assert "6.07%" in md
+        assert "FCF收益率" in md
+
+    def test_17_8_verified_fcff_preferred_over_proxy(self, client):
+        _make_ev_ready(client)
+        client._store["cashflow"]["fcff"] = [2000e6] * 5
+        client._store["fcff_verified"] = True
+        md = client.compute_derived_metrics("600887.SH")
+        assert "来源核对 FCFF" in md
+        # 2000 百万 / 186282 百万 = 1.07%, not the 6.07% proxy.
+        assert "1.07%" in md and "6.07%" not in md
+
+    def test_17_8_missing_goodwill_not_treated_as_zero(self, client):
+        _make_ev_ready(client)
+        client._store["balance_sheet"].loc[0, "goodwill"] = float("nan")
+        md = client.compute_derived_metrics("600887.SH")
+        assert "—（未核实）" in md
+        assert "商誉缺失时为未核实" in md
+        # 0.00% would mean goodwill was fabricated as zero.
+        assert "商誉/总资产 | 0.00%" not in md
+
+    def test_17_6_and_17_8_low_use_hfq_when_available(self, client):
+        _make_ev_ready(client)
+        hfq = client._store["weekly_prices"].copy()
+        for col in ("high", "low", "close"):
+            hfq[col] = hfq[col] * 2.0
+        client._store["weekly_prices_hfq"] = hfq
+        md = client.compute_derived_metrics("600887.SH")
+        assert "后复权" in md
+        assert "折算" in md
+        # hfq min 20.0 ÷ factor 2 → current-price basis 10.00
+        assert "③ 10年最低价（后复权折算）" in md
+
+    def test_17_6_labels_unadjusted_fallback(self, client):
+        _make_ev_ready(client)
+        md = client.compute_derived_metrics("600887.SH")
+        assert "回退未复权周线" in md
+        assert "含除权/除息不可比" in md
+
+    def test_m_payout_requires_three_complete_years(self, client):
+        _make_ev_ready(client)
+        divs = client._store["dividends"]
+        # Keep FY2025 (final + interim) and FY2024 only → 2 usable years.
+        divs = divs[divs["end_date"].astype(str).str[:4].isin(["2025", "2024"])]
+        client._store["dividends"] = divs.reset_index(drop=True)
+        md = client.compute_derived_metrics("600887.SH")
+        assert "仅 2 年" in md and "不足3年" in md
+        # §17.9 must state the degraded reason instead of vanishing silently.
+        assert "17.9" in md and "不输出敏感性表" in md
+        # §17.10 法3 3-year mean suppressed with the same rule.
+        assert client._store["payout_crosscheck"]["m3"] is None
+        assert "法3 可用完整年度仅 2 年" in md
+        # §17.2 M value is "—", not an average over the shorter window.
+        assert "| M（支付率3年均值） | — |" in md
+
+
+class TestRefreshPreservesAgentRisk:
+    OLD = ("# 数据包 — 600001.SH\n\n"
+           "*生成时间: 2026-10-30 10:00:00*\n*财务采集时间: 2026-10-30 10:00:00*\n\n---\n\n"
+           "## 13. 风险警示\n\n### 13.1 脚本自动检测\n\nOLD_AUTO\n\n"
+           "### 13.2 Agent WebSearch 补充\n\nAGENT_RISK_RESEARCH\n\n")
+
+    FRESH = ("# 数据包 — 600001.SH\n\n"
+             "*生成时间: 2026-11-01 10:00:00*\n*财务采集时间: 2026-11-01 10:00:00*\n\n---\n\n"
+             "## 13. 风险警示\n\n### 13.1 脚本自动检测\n\nNEW_AUTO\n\n"
+             "### 13.2 Agent WebSearch 补充\n\n*[§13.2 待Agent WebSearch补充]*\n\n")
+
+    def test_refresh_keeps_13_2_agent_research(self, monkeypatch):
+        from akshare_collector import AKShareClient
+        c = AKShareClient(no_cache=True)
+        monkeypatch.setattr(c, "assemble_data_pack", lambda code: self.FRESH)
+        out = c.refresh_market_sections("600001.SH", self.OLD)
+        # 13.1 regenerated from fresh snapshot, 13.2 Agent research preserved.
+        assert "NEW_AUTO" in out and "OLD_AUTO" not in out
+        assert "AGENT_RISK_RESEARCH" in out
+        assert "*[§13.2 待Agent WebSearch补充]*" not in out
+        assert out.count("上期 Agent 风险补充") == 1
+
+    def test_repeated_refresh_does_not_duplicate_notice(self, monkeypatch):
+        from akshare_collector import AKShareClient
+        c = AKShareClient(no_cache=True)
+        monkeypatch.setattr(c, "assemble_data_pack", lambda code: self.FRESH)
+        first = c.refresh_market_sections("600001.SH", self.OLD)
+        second = c.refresh_market_sections("600001.SH", first)
+        assert second.count("AGENT_RISK_RESEARCH") == 1
+        assert second.count("上期 Agent 风险补充") == 1
+
+    def test_placeholder_only_old_13_2_keeps_fresh_placeholder(self, monkeypatch):
+        from akshare_collector import AKShareClient
+        c = AKShareClient(no_cache=True)
+        monkeypatch.setattr(c, "assemble_data_pack", lambda code: self.FRESH)
+        old = self.OLD.split("AGENT_RISK_RESEARCH")[0] + "*[§13.2 待Agent WebSearch补充]*\n\n"
+        out = c.refresh_market_sections("600001.SH", old)
+        assert "*[§13.2 待Agent WebSearch补充]*" in out
+
+
+def test_assembly_header_backfills_financial_collected_at(monkeypatch):
+    """Header is rendered before fetches; real financial time must replace it."""
+    from akshare_collector import AKShareClient
+    c = AKShareClient(no_cache=True)
+
+    def fake_get(code):
+        c._store["_financial_collected_at"] = "2026-11-01 10:00:00"
+        return "数据缺失\n"
+
+    for name in dir(c):
+        if name.startswith("get_"):
+            monkeypatch.setattr(c, name, fake_get)
+    text = c.assemble_data_pack("600001.SH")
+    assert "*财务采集时间: 2026-11-01 10:00:00*" in text

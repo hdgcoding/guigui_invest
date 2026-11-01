@@ -60,7 +60,8 @@ def test_financial_indicators_derive_partial_fields_without_fake_weighted_roe(fi
 def test_quote_date_mismatch_blocks_share_inference(financial_client, monkeypatch):
     monkeypatch.setattr(financial_client, "_fetch_name_and_list_date", lambda code: ("测试", "20000101"))
     monkeypatch.setattr(financial_client, "_fetch_latest_daily", lambda num: {"close": 10, "date": "20261030"})
-    monkeypatch.setattr(financial_client, "_fetch_valuation", lambda num: {"total_mv_wan": 100000, "date": "20261029"})
+    monkeypatch.setattr(financial_client, "_fetch_valuation",
+                            lambda num, price_date=None: {"total_mv_wan": 100000, "date": "20261029"})
     md = financial_client.get_basic_info("600001.SH")
     row = financial_client._store["basic_info"].iloc[0]
     assert row["total_share"] is None and row["total_mv"] is None

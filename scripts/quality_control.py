@@ -160,6 +160,33 @@ def find_item(data: Dict[str, dict], *names: str) -> Optional[str]:
     return None
 
 
+def _normalized_item_key(name: str) -> str:
+    return name.replace(" ", "").replace("（", "(").replace("）", ")").strip()
+
+
+# classification_rules.md D1 口径 = §12「ROE 加权」5 年均值. The §12 table puts
+# "ROE 摊薄 (%)" BEFORE "ROE 加权 (%)", so generic find_item silently lands on the
+# diluted row. Never fall back to 摊薄/未加权 ROE: missing → 未核实 + annotation.
+ROE_WEIGHTED_ALIASES = (
+    "ROE 加权 (%)", "ROE加权(%)", "ROE 加权", "加权净资产收益率(%)",
+    "加权净资产收益率", "加权ROE(%)", "加权ROE",
+)
+
+
+def find_weighted_roe(data: Dict[str, dict]) -> Optional[str]:
+    """Return the §12 weighted-ROE row key, or None (never the diluted row)."""
+    normalized = {_normalized_item_key(key): key for key in data}
+    for alias in ROE_WEIGHTED_ALIASES:
+        key = normalized.get(_normalized_item_key(alias))
+        if key is not None:
+            return key
+    for key in data:
+        compact = _normalized_item_key(key).lower()
+        if "加权" in compact and ("roe" in compact or "净资产收益率" in compact):
+            return key
+    return None
+
+
 def _series(data, item_key, years):
     row = data.get(item_key, {}) if item_key else {}
     return [row.get(y) for y in years]
@@ -238,19 +265,31 @@ def build_report(sections: Dict[str, str], pe_bands: List[float],
     if not years:
         parts.append("> ⚠️ CM§3 跳过：缺少年度序列。\n")
     else:
+        roe_key = find_weighted_roe(fin)
+        roe_years = _full_years(fin_cols)
+        roe_vals = _series(fin, roe_key, roe_years) if roe_key else []
+        roe_missing = not roe_key or all(v is None for v in roe_vals)
         stat_specs = [
             ("营业收入(亿元)", [to_yi(v) for v in _series(inc, find_item(inc, "营业收入"), years)]),
             ("归母净利润(亿元)", [to_yi(v) for v in _series(inc, find_item(inc, "归母净利润"), years)]),
-            ("ROE(%)", _series(fin, find_item(fin, "ROE", "净资产收益率"), _full_years(fin_cols))),
-            ("毛利率(%)", _series(fin, find_item(fin, "毛利率"), _full_years(fin_cols))),
-            ("净利率(%)", _series(fin, find_item(fin, "净利率"), _full_years(fin_cols))),
+            ("ROE加权(%)", roe_vals),
+            ("毛利率(%)", _series(fin, find_item(fin, "毛利率"), roe_years)),
+            ("净利率(%)", _series(fin, find_item(fin, "净利率"), roe_years)),
         ]
         rows = []
         for label, vals in stat_specs:
             st = multi_year_stats(vals)
-            rows.append([label, format_number(st["mean"], divider=1),
-                         format_number(st["median"], divider=1), str(st["n"])])
+            if label.startswith("ROE") and roe_missing:
+                rows.append([label, "未核实", "未核实", "0"])
+            else:
+                rows.append([label, format_number(st["mean"], divider=1),
+                             format_number(st["median"], divider=1), str(st["n"])])
         parts.append(format_table(["指标", "均值", "中位数", "年数"], rows, ["l", "r", "r", "r"]))
+        if roe_missing:
+            parts.append(
+                "> ⚠️ CM§3 ROE 标注：§12 缺「ROE 加权 (%)」/「加权净资产收益率」，"
+                "记为未核实；**不得用摊薄 ROE 或自行推导值替代**"
+                "（classification_rules.md D1 要求加权 ROE 5 年均值）。\n")
         parts.append("")
 
     # ── CM§4 分红支付率 ──

@@ -7,10 +7,16 @@ exchange listing tables); Tier 2 reuses AKShareClient's per-stock fetchers
 for deep analysis (hard vetoes, quality, Factor 2/4, floor price, scoring).
 
 Data-source notes (vs original):
-- PE is static (latest annual EPS), not TTM — documented approximation.
+- PE basis: TTM PE is preferred when the bulk source supplies it; otherwise a
+  static PE (close / latest annual EPS) is used. The basis is exported per row
+  as ``pe_basis`` so the approximation is never implicit.
+- The comprehensive score uses four always-available factors; the penetration
+  return R participates only when R is verified (never as the consolidated
+  cash proxy). Weights are renormalized over the participating factors.
 - Turnover-rate filter is replaced by a daily-turnover-amount liquidity
   proxy (sina spot has no float shares).
-- Audit opinion is unavailable via AKShare → audit veto skipped.
+- Audit opinion / pledge detail are unavailable via AKShare in some cases →
+  such rows are flagged as unverified/degraded, not treated as a pass.
 
 Usage:
     python3 scripts/screener_core.py --tier1-only
@@ -31,24 +37,95 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from akshare_collector import AKShareClient  # noqa: E402
 from akshare_modules.constants import (  # noqa: E402
-    SINA_INCOME_MAP, SINA_BALANCE_MAP, SINA_CASHFLOW_MAP,
+    CACHE_TTL_CATEGORY, SINA_INCOME_MAP, SINA_BALANCE_MAP, SINA_CASHFLOW_MAP,
 )
 from cache_utils import ScreenerCache  # noqa: E402
 from screener_config import ScreenerConfig  # noqa: E402
-from financial_contracts import debt, depreciation, annual_dividends, statement_issues  # noqa: E402
+from financial_contracts import (  # noqa: E402
+    debt, depreciation, annual_dividends, number, statement_issues,
+)
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+
+# factor key (ScreenerConfig.renormalized_scoring_weights) → percentile column
+_FACTOR_PCTILE_COLUMNS = {
+    "roe": "roe_waa_pctile",
+    "fcf_yield": "fcf_yield_pctile",
+    "ev_ebitda": "ev_ebitda_pctile",
+    "floor_premium": "floor_premium_pctile",
+    "penetration_r": "R_pctile",
+}
+
+
+class _FixedTTLCache:
+    """Cache facade that ignores the TTL passed by the caller.
+
+    Lets ``_ScreenerAKShareClient._cached_call`` reuse the collector's cache
+    contract unchanged while substituting the screener-configured TTL.
+    """
+
+    def __init__(self, cache, ttl_seconds: int):
+        self._cache = cache
+        self._ttl_seconds = ttl_seconds
+
+    def get(self, key, _ttl_seconds=None):
+        return self._cache.get(key, self._ttl_seconds)
+
+    def put(self, key, df):
+        return self._cache.put(key, df)
+
+
+class _ScreenerAKShareClient(AKShareClient):
+    """AKShareClient whose disk-cache TTLs follow ScreenerConfig cache_* fields.
+
+    Tier 2 reuses the collector's per-stock fetchers; only their TTL source
+    differs (collector constants vs screener configuration). Delegating to the
+    parent ``_cached_call`` keeps fetch-time bookkeeping/behaviour identical.
+    """
+
+    def __init__(self, ttl_seconds: dict[str, int]):
+        super().__init__()
+        self._screener_ttls = dict(ttl_seconds)
+
+    def _ttl_seconds(self, endpoint: str, category: str | None) -> int:
+        if endpoint == "risk_free_rate":
+            return int(self._screener_ttls["rf"])
+        if category == "financial":
+            return int(self._screener_ttls["financial"])
+        if category == "market":
+            return int(self._screener_ttls["market"])
+        return int(self._screener_ttls["tier2"])
+
+    def _cached_call(self, endpoint: str, fetch, key: str | None = None) -> pd.DataFrame:
+        ttl = self._ttl_seconds(endpoint, CACHE_TTL_CATEGORY.get(endpoint))
+        real_cache = self._cache
+        self._cache = _FixedTTLCache(real_cache, ttl)
+        try:
+            return super()._cached_call(endpoint, fetch, key=key)
+        finally:
+            self._cache = real_cache
+
 
 class AKShareScreener:
     """Two-tier stock screener backed by AKShare bulk + per-stock endpoints."""
 
     def __init__(self, config: ScreenerConfig | None = None):
         self.config = config or ScreenerConfig()
+        self._validate_config()
         self.cache = ScreenerCache(os.path.join(ROOT, self.config.cache_dir))
-        self.client = AKShareClient()
-        # Reuse the collector's per-stock TTL cache (financial 7d / market 24h)
+        self.client = _ScreenerAKShareClient(self.config.cache_ttl_seconds)
         self._rf_cache: float | None = None
         self.diagnostics = []
+        # Last bulk-cache outcome: hit | fetched | empty | failed (failed means
+        # the endpoint raised, which is different from an authoritative empty
+        # answer — callers must not read empty as "no risk").
+        self._last_bulk_status: str | None = None
+
+    def _validate_config(self) -> None:
+        """Reject invalid configuration instead of silently using wrong weights."""
+        errors = self.config.validate()
+        if errors:
+            raise ValueError("Invalid ScreenerConfig: " + "; ".join(errors))
 
     # ------------------------------------------------------------------
     # Generic cached bulk fetch
@@ -57,11 +134,14 @@ class AKShareScreener:
     def _bulk_cached(self, key: str, ttl_seconds: int, fetch) -> pd.DataFrame:
         cached = self.cache.get(key, ttl_seconds)
         if cached is not None:
+            self._last_bulk_status = "hit"
             return cached
         df = self.client._fetch_with_retry(fetch)
         if df is not None and not df.empty:
             self.cache.put(key, df)
+            self._last_bulk_status = "fetched"
             return df
+        self._last_bulk_status = "empty" if df is not None else "failed"
         return pd.DataFrame()
 
     # ------------------------------------------------------------------
@@ -74,7 +154,7 @@ class AKShareScreener:
             import akshare as ak
             return ak.stock_zh_a_spot()
         # same-day cache
-        df = self._bulk_cached("spot_sina", 6 * 3600, _fetch)
+        df = self._bulk_cached("spot_sina", self.config.cache_ttl_seconds["spot"], _fetch)
         if df.empty:
             return df
 
@@ -112,11 +192,11 @@ class AKShareScreener:
             return _fetch
 
         date = self._latest_annual_date()
-        df = self._bulk_cached(f"yjbb:{date}", 24 * 3600, _make_fetch(date))
+        df = self._bulk_cached(f"yjbb:{date}", self.config.cache_ttl_seconds["global"], _make_fetch(date))
         # Sparse (reports not yet published at year start) → fallback one year earlier
         if len(df) < 500:
             prev = f"{int(date[:4]) - 1}1231"
-            df = self._bulk_cached(f"yjbb:{prev}", 24 * 3600, _make_fetch(prev))
+            df = self._bulk_cached(f"yjbb:{prev}", self.config.cache_ttl_seconds["global"], _make_fetch(prev))
         if df.empty:
             return df
 
@@ -154,7 +234,7 @@ class AKShareScreener:
                 return pd.DataFrame()
             return pd.concat(frames, ignore_index=True)
 
-        df = self._bulk_cached("listing_dates", 7 * 24 * 3600, _fetch)
+        df = self._bulk_cached("listing_dates", self.config.cache_ttl_seconds["stock_basic"], _fetch)
         if df.empty:
             return df
         df = df.copy()
@@ -179,7 +259,7 @@ class AKShareScreener:
         for period in periods:
             def _fetch(p=period):
                 return ak.stock_fhps_em(date=p)
-            df = self._bulk_cached(f"fhps:{period}", 24 * 3600, _fetch)
+            df = self._bulk_cached(f"fhps:{period}", self.config.cache_ttl_seconds["global"], _fetch)
             if not df.empty and "代码" in df.columns:
                 df = df.copy()
                 df["_period"] = period
@@ -257,6 +337,38 @@ class AKShareScreener:
         df["total_mv"] = df["close"] * df["total_shares"] / 1e4        # 万元
         df["ts_code"] = df["code"] + df["code"].map(
             lambda c: ".SH" if c.startswith(("6",)) else ".SZ")
+        return self._attach_pe_columns(df)
+
+    # ------------------------------------------------------------------
+    # PE basis (TTM preferred, static fallback)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _attach_pe_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """Add canonical ``pe`` + honest ``pe_basis`` columns.
+
+        A TTM PE wins whenever the bulk source supplies a finite value; the
+        static PE (close / latest-annual EPS) is only the fallback. Both source
+        columns stay available for diagnostics, and ``pe_basis`` records which
+        one was actually used so the approximation is never implicit.
+        """
+        df = df.copy()
+        if "pe_static" not in df.columns:
+            eps = pd.to_numeric(df.get("eps"), errors="coerce") if "eps" in df.columns else None
+            close = pd.to_numeric(df.get("close"), errors="coerce") if "close" in df.columns else None
+            if eps is not None and close is not None:
+                df["pe_static"] = close / eps.where(eps > 0)
+            else:
+                df["pe_static"] = float("nan")
+        df["pe_static"] = pd.to_numeric(df["pe_static"], errors="coerce")
+        if "pe_ttm" in df.columns:
+            df["pe_ttm"] = pd.to_numeric(df["pe_ttm"], errors="coerce")
+        else:
+            df["pe_ttm"] = float("nan")
+        df["pe"] = df["pe_ttm"].where(df["pe_ttm"].notna(), df["pe_static"])
+        df["pe_basis"] = "缺失"
+        df.loc[df["pe_static"].notna(), "pe_basis"] = "静态（最新年报EPS）"
+        df.loc[df["pe_ttm"].notna(), "pe_basis"] = "TTM"
         return df
 
     # ------------------------------------------------------------------
@@ -271,10 +383,7 @@ class AKShareScreener:
 
         cfg = self.config
         today = datetime.now()
-        df = df.copy()
-        # Compatibility with callers of the old API; exports use honest name.
-        if "pe_static" not in df:
-            df["pe_static"] = df.get("pe_ttm", float("nan"))
+        df = self._attach_pe_columns(df)
 
         # 1. Remove ST/PT/退市整理
         df = df[~df["name"].str.contains(r"\*ST|ST|PT|退市|退", na=False, regex=True)].copy()
@@ -299,9 +408,9 @@ class AKShareScreener:
         df = df[df["pb"].notna()].copy()
         df = df[(df["pb"] > 0) & (df["pb"] <= cfg.max_pb)].copy()
 
-        # 6. Dual-channel PE split
-        pe_valid = df["pe_static"].notna()
-        main_mask = pe_valid & (df["pe_static"] > 0) & (df["pe_static"] <= cfg.max_pe)
+        # 6. Dual-channel PE split (canonical pe column: TTM-first, static fallback)
+        pe_valid = df["pe"].notna() & (df["pe"] > 0)
+        main_mask = pe_valid & (df["pe"] <= cfg.max_pe)
         obs_mask = ~pe_valid & df["eps"].notna() & (df["eps"] < 0)
 
         main_df = df[main_mask].copy()
@@ -329,7 +438,7 @@ class AKShareScreener:
             dv_max = main["dv_ttm"].max()
             main["_dv_norm"] = main["dv_ttm"] / dv_max if dv_max > 0 else 0
 
-            pe_inv = 1.0 / main["pe_static"]
+            pe_inv = 1.0 / main["pe"]
             pe_max = pe_inv.max()
             main["_pe_norm"] = pe_inv / pe_max if pe_max > 0 else 0
 
@@ -402,22 +511,68 @@ class AKShareScreener:
     # ------------------------------------------------------------------
 
     def _check_hard_vetoes(self, ts_code: str) -> tuple[bool, str]:
+        """Pledge veto + explicit degradation flags.
+
+        A failing/empty pledge endpoint must never be read as "no pledge risk".
+        Such rows stay eligible as *candidates* (the API is flaky by nature)
+        but carry unverified/degraded flags into the exported columns.
+        """
         num = ts_code.split(".")[0]
-        self._veto_checks = {"audit_status": "未核实（不等于通过）", "pledge_status": "未核实（不等于通过）"}
+        flags: list[str] = []
+        self._veto_checks: dict[str, Any] = {
+            "audit_status": "未核实（不等于通过）",
+            "pledge_status": "未核实（不等于通过）",
+            "degraded_flags": "",
+        }
+        # Audit opinion has no stable auto source via AKShare → degrade, never pass.
+        flags.append("audit_unverified")
         try:
             def _fetch():
                 import akshare as ak
                 return ak.stock_gpzy_individual_pledge_ratio_detail_em(symbol=num)
-            df = self._bulk_cached(f"pledge:{num}", 24 * 3600, _fetch)
-            if df is not None and not df.empty and "占总股本比例" in df.columns:
-                ratios = pd.to_numeric(df["占总股本比例"], errors="coerce").dropna()
-                if not ratios.empty:
-                    self._veto_checks["pledge_status"] = "接口有数据，需核对未解押范围"
-                if not ratios.empty and float(ratios.sum()) > self.config.max_pledge_pct:
-                    return False, f"pledge_ratio={ratios.sum():.1f}% > {self.config.max_pledge_pct}%"
-        except Exception:
-            pass
-        # Audit opinion unavailable via AKShare → veto skipped (documented)
+            df = self._bulk_cached(
+                f"pledge:{num}", self.config.cache_ttl_seconds["tier2"], _fetch)
+            fetch_status = self._last_bulk_status
+            if fetch_status == "failed":
+                self._veto_checks["pledge_status"] = "未核实：质押接口调用失败（不等于无质押）"
+                flags.append("pledge_unverified")
+            elif df is None or df.empty or "占总股本比例" not in df.columns:
+                self._veto_checks["pledge_status"] = "未核实：质押接口无数据/缺字段（不等于无质押）"
+                flags.append("pledge_unverified")
+            else:
+                has_status = "状态" in df.columns
+                if has_status:
+                    scoped = df[df["状态"].astype(str).str.contains("未解押", na=False)]
+                    scope_label = "未解押明细"
+                else:
+                    scoped = df
+                    scope_label = "全部明细（未解押范围未核对）"
+                    flags.append("pledge_scope_unverified")
+                ratios = pd.to_numeric(scoped["占总股本比例"], errors="coerce").dropna()
+                if ratios.empty:
+                    if has_status:
+                        # Every record is already released → 0% outstanding.
+                        pledge_ratio = 0.0
+                        self._veto_checks["pledge_ratio"] = pledge_ratio
+                        self._veto_checks["pledge_status"] = (
+                            "已统计未解押明细：0.00%（记录均为已解押）")
+                    else:
+                        self._veto_checks["pledge_status"] = (
+                            f"未核实：{scope_label}无可用占比（不等于无质押）")
+                        flags.append("pledge_unverified")
+                else:
+                    pledge_ratio = float(ratios.sum())
+                    self._veto_checks["pledge_ratio"] = pledge_ratio
+                    self._veto_checks["pledge_status"] = f"已统计{scope_label}：{pledge_ratio:.2f}%"
+                    if pledge_ratio > self.config.max_pledge_pct:
+                        flags.append("pledge_veto")
+                        self._veto_checks["degraded_flags"] = ";".join(dict.fromkeys(flags))
+                        return False, f"pledge_ratio={pledge_ratio:.1f}% > {self.config.max_pledge_pct}%"
+        except Exception as exc:  # noqa: BLE001 - degrade, do not silently pass
+            self._veto_checks["pledge_status"] = (
+                f"未核实：质押接口异常 {type(exc).__name__}（不等于无质押）")
+            flags.append("pledge_unverified")
+        self._veto_checks["degraded_flags"] = ";".join(dict.fromkeys(flags))
         return True, ""
 
     # ------------------------------------------------------------------
@@ -570,14 +725,29 @@ class AKShareScreener:
         aa_raw = summary.get("aa_selected")
         AA = aa_raw / 1e6 if aa_raw is not None else None
         result["AA_proxy"] = AA
-        result["R_basis"] = "合并OCF−Capex代理，未完成归母现金穿透"
 
-        if AA is not None and result.get("M") is not None and mkt_cap > 0:
-            R = AA * (result["M"] / 100) / mkt_cap * 100
-            result["R_proxy"] = R
-            result["R"] = None  # not a verified penetration-return metric
+        # R only becomes a scored factor when it is *verified*: source-reconciled
+        # owner cash + verified share count/market cap. The consolidated OCF−Capex
+        # proxy is kept as a diagnostic (R_proxy), never as a scored R.
+        verified = self._verified_penetration_r(result.get("M"))
+        if verified is not None:
+            result.update(verified)
+            result["R_status"] = "verified"
         else:
             result["R"] = None
+            result["R_status"] = "missing"
+
+        if AA is not None and result.get("M") is not None and mkt_cap > 0:
+            result["R_proxy"] = AA * (result["M"] / 100) / mkt_cap * 100
+            if result["R_status"] != "verified":
+                result["R_status"] = "proxy_unverified"
+            result["R_proxy_label"] = "合并OCF−Capex现金代理×M/市值（代理口径，未核实，不进入综合分）"
+        else:
+            result["R_proxy"] = None
+
+        result["R_basis"] = (
+            verified["R_basis"] if verified is not None
+            else "合并OCF−Capex代理，未完成归母现金穿透")
 
         if result.get("R") is not None and result.get("II") is not None and rf is not None:
             R, II = result["R"], result["II"]
@@ -592,6 +762,42 @@ class AKShareScreener:
         else:
             result["R_vs_II"] = None
         return result
+
+    def _verified_penetration_r(self, m_pct: float | None) -> dict[str, Any] | None:
+        """Return a verified penetration return, else None.
+
+        Verification requires evidence the network endpoints cannot supply:
+        decision-eligible AA from source-reconciled owner cash, a verified
+        share count/market cap (``basic_info.shares_verified``), and aligned
+        statement periods. When missing, R must stay out of the composite.
+        """
+        store = self.client._store
+        summary = store.get("factor3_sensitivity") or {}
+        basic = store.get("basic_info")
+        if not isinstance(basic, pd.DataFrame) or basic.empty:
+            return None
+        if not summary.get("decision_eligible"):
+            return None
+        row = basic.iloc[0]
+        if str(row.get("shares_verified", False)).lower() != "true":
+            return None
+        if statement_issues(store):
+            return None
+        aa_yuan = number(summary.get("aa_selected"))
+        mkt_cap_wan = number(row.get("total_mv"))
+        if aa_yuan is None or mkt_cap_wan is None or mkt_cap_wan <= 0 or m_pct is None:
+            return None
+        mkt_cap_mm = mkt_cap_wan / 100  # 万元 → 百万元
+        _, default_tax = self.client._unique_tax_rates(str(row.get("ts_code", "")))
+        tax = default_tax if default_tax is not None else 0.0
+        ratio = aa_yuan / 1e6 * (m_pct / 100) * (1 - tax / 100) / mkt_cap_mm * 100
+        return {
+            "R": ratio,
+            "R_basis": "来源核对归母现金×M/核实股本市值（税后），已核实",
+            "R_aa_verified": aa_yuan / 1e6,
+            "R_tax_pct": tax,
+            "R_mkt_cap_verified": mkt_cap_mm,
+        }
 
     # ------------------------------------------------------------------
     # Tier 2: Factor 4 (valuation)
@@ -740,14 +946,19 @@ class AKShareScreener:
             "ts_code": ts_code, "name": row.get("name", ""),
             "industry": row.get("industry", ""), "channel": channel,
             "close": close, "total_mv": total_mv_wan,
-            "pe_static": row.get("pe_static", row.get("pe_ttm")), "pb": row.get("pb"),
-            "dv_ttm": row.get("dv_ttm"),
+            "pe": row.get("pe"), "pe_basis": row.get("pe_basis", "缺失"),
+            "pe_static": row.get("pe_static", row.get("pe_ttm")),
+            "pe_ttm": row.get("pe_ttm"),
+            "pb": row.get("pb"), "dv_ttm": row.get("dv_ttm"),
             "audit_status": "未核实（不等于通过）", "data_status": "候选，非买入建议",
             "shares_basis": row.get("shares_basis", "未核实"),
         }
 
         passed, reason = self._check_hard_vetoes(ts_code)
         result.update(getattr(self, "_veto_checks", {}))
+        degraded = str(result.get("degraded_flags") or "")
+        if degraded:
+            result["data_status"] = f"候选，非买入建议；未核实/降级：{degraded}"
         if not passed:
             result["veto"] = reason
             return None
@@ -761,9 +972,10 @@ class AKShareScreener:
             return None
 
         f2 = self._extract_factor2_metrics(total_mv_wan)
-        result.update({"M": f2.get("M"), "R": f2.get("R"), "II": f2.get("II"),
-                       "Rf": f2.get("Rf"), "R_vs_II": f2.get("R_vs_II")})
-        result.update({k: f2.get(k) for k in ("AA_proxy", "R_proxy", "R_basis")})
+        result.update({k: f2.get(k) for k in (
+            "M", "R", "R_status", "R_proxy", "R_proxy_label", "R_basis",
+            "R_aa_verified", "R_tax_pct", "R_mkt_cap_verified",
+            "II", "Rf", "R_vs_II", "AA_proxy")})
 
         f4 = self._extract_factor4_metrics(total_mv_wan)
         result.update({k: f4.get(k) for k in (
@@ -779,37 +991,94 @@ class AKShareScreener:
     # Scoring
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _rank_pctile(values: pd.Series, ascending: bool = True) -> pd.Series:
+        clean = pd.to_numeric(values, errors="coerce").replace(
+            [float("inf"), -float("inf")], float("nan"))
+        return clean.rank(pct=True, ascending=ascending, na_option="keep").fillna(0)
+
     def _compute_rankings(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Composite score over four factors + optional verified penetration R.
+
+        Weight renormalization is the core contract here: when no row has a
+        verified R, the 25% R weight is removed and the remaining four weights
+        are rescaled to sum to 1.0 (the composite stays on a full [0, 1]
+        scale). ``df.attrs["scoring"]`` records which factors were active.
+        """
         if df.empty:
             return df
         cfg = self.config
         df = df.copy()
 
-        for col in ("roe_waa", "fcf_yield", "R"):
-            source = "roe_metric" if col == "roe_waa" and "roe_metric" in df else col
-            df[f"{col}_pctile"] = (pd.to_numeric(df[source], errors="coerce").replace([float("inf"), -float("inf")], float("nan"))
-                                   .rank(pct=True, na_option="keep").fillna(0)
-                                   if source in df.columns else 0.0)
-        for col in ("ev_ebitda", "floor_premium"):
-            df[f"{col}_pctile"] = (pd.to_numeric(df[col], errors="coerce").replace([float("inf"), -float("inf")], float("nan"))
-                                   .rank(pct=True, ascending=False, na_option="keep").fillna(0)
-                                   if col in df.columns else 0.0)
+        if "roe_metric" in df.columns:
+            roe_source = df["roe_metric"]
+        elif "roe_waa" in df.columns:  # legacy callers / hand-built frames
+            roe_source = df["roe_waa"]
+        else:
+            roe_source = pd.Series(float("nan"), index=df.index)
+        df["roe_waa_pctile"] = self._rank_pctile(roe_source)
+        for col in ("fcf_yield", "R", "ev_ebitda", "floor_premium"):
+            values = (df[col] if col in df.columns
+                      else pd.Series(float("nan"), index=df.index))
+            df[f"{col}_pctile"] = self._rank_pctile(
+                values, ascending=col not in ("ev_ebitda", "floor_premium"))
 
-        df["composite_score"] = (
-            cfg.weight_roe * df["roe_waa_pctile"]
-            + cfg.weight_fcf_yield * df["fcf_yield_pctile"]
-            + cfg.weight_penetration_r * df["R_pctile"]
-            + cfg.weight_ev_ebitda * df["ev_ebitda_pctile"]
-            + cfg.weight_floor_premium * df["floor_premium_pctile"]
-        )
-        return df.sort_values("composite_score", ascending=False)
+        r_values = (pd.to_numeric(df["R"], errors="coerce")
+                    if "R" in df.columns else pd.Series(dtype=float))
+        include_r = bool(cfg.weight_penetration_r > 0 and r_values.notna().any())
+        if "R_status" not in df.columns:
+            df["R_status"] = "missing"
+        weights = cfg.renormalized_scoring_weights(include_penetration_r=include_r)
+        df["composite_score"] = sum(
+            weight * df[_FACTOR_PCTILE_COLUMNS[factor]]
+            for factor, weight in weights.items())
+        df["composite_n_factors"] = len(weights)
+        df["composite_r_included"] = include_r
+        df["composite_factors"] = "+".join(weights)
+        out = df.sort_values("composite_score", ascending=False)
+        out.attrs["scoring"] = {"factors": list(weights), "weights": weights,
+                                "penetration_r_included": include_r}
+        return out
 
     # ------------------------------------------------------------------
     # Pipeline
     # ------------------------------------------------------------------
 
+    def _apply_tier2_limit(self, ranked: pd.DataFrame,
+                           tier2_limit: int | None) -> pd.DataFrame:
+        """Cap Tier 2 intake without starving the observation channel.
+
+        The budget is split by channel in proportion to the configured channel
+        caps (``tier2_main_limit`` : ``obs_channel_limit``), with the
+        observation channel guaranteed at least one slot when it has names.
+        A bare ``head(tier2_limit)`` would drop the whole observation channel
+        whenever the main channel fills the list (e.g. ``--tier2-limit 3``).
+        """
+        if tier2_limit is None:
+            return ranked
+        if tier2_limit < 1:
+            raise ValueError("tier2_limit must be >= 1")
+        if ranked.empty:
+            return ranked
+        main = ranked[ranked["channel"] == "main"]
+        obs = ranked[ranked["channel"] == "observation"]
+        channel_caps = self.config.tier2_max_stocks
+        obs_quota = (round(tier2_limit * self.config.obs_channel_limit
+                           / channel_caps) if channel_caps > 0 else 0)
+        if len(obs) and tier2_limit >= 1:
+            obs_quota = max(obs_quota, 1)
+        obs_quota = min(obs_quota, len(obs), tier2_limit)
+        main_quota = tier2_limit - obs_quota
+        main_keep = main.head(main_quota)
+        obs_keep = obs.head(obs_quota)
+        return pd.concat([main_keep, obs_keep], ignore_index=True)
+
     def run(self, tier1_only: bool = False, tier2_limit: int | None = None,
             progress_callback=None) -> pd.DataFrame:
+        # Config may be mutated after __init__ (CLI overrides/tests): re-validate.
+        self._validate_config()
+        if tier2_limit is not None and tier2_limit < 1:
+            raise ValueError("tier2_limit must be >= 1")
         print("=== Tier 1: Bulk screening (AKShare) ===")
         bulk_df = self._tier1_bulk_data()
         print(f"  Universe: {len(bulk_df)} stocks")
@@ -829,7 +1098,13 @@ class AKShareScreener:
             return ranked
 
         if tier2_limit is not None:
-            ranked = ranked.head(tier2_limit)
+            before = len(ranked)
+            ranked = self._apply_tier2_limit(ranked, tier2_limit)
+            n_main = len(ranked[ranked["channel"] == "main"])
+            n_obs = len(ranked[ranked["channel"] == "observation"])
+            print(f"  After --tier2-limit {tier2_limit} (dual-channel quota): "
+                  f"{len(ranked)} stocks (main: {n_main}, observation: {n_obs}; "
+                  f"candidates: {before})")
 
         total = len(ranked)
         print(f"\n=== Tier 2: Deep analysis ({total} stocks) ===")
@@ -856,6 +1131,16 @@ class AKShareScreener:
         if not results:
             return pd.DataFrame()
         result_df = self._compute_rankings(pd.DataFrame(results))
+        scoring = result_df.attrs.get("scoring", {})
+        if scoring:
+            print(f"  Composite factors: {'+'.join(scoring.get('factors', []))}"
+                  f" (R included: {scoring.get('penetration_r_included')})")
+        if "degraded_flags" in result_df.columns:
+            n_degraded = int(result_df["degraded_flags"].fillna("").astype(str)
+                             .str.len().gt(0).sum())
+            if n_degraded:
+                print(f"  ⚠️ {n_degraded} rows carry unverified/degraded flags "
+                      f"(candidates, never a risk pass)")
         print(f"\n=== Results: {len(result_df)} stocks passed ===")
         return result_df
 
@@ -871,13 +1156,23 @@ class AKShareScreener:
     def export_html(self, df: pd.DataFrame, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         cols = ["ts_code", "name", "industry", "channel", "close",
-                "pe_static", "pb", "dv_ttm", "roe_metric", "roe_basis", "M", "R", "R_vs_II",
-                "data_status", "audit_status", "pledge_status", "shares_basis",
-                "ev_ebitda", "fcf_yield", "cash_adj_pe", "goodwill_ratio",
-                "floor_baseline", "floor_premium", "composite_score"]
+                "pe", "pe_basis", "pb", "dv_ttm", "roe_metric", "roe_basis",
+                "M", "R", "R_status", "R_proxy", "R_vs_II",
+                "data_status", "audit_status", "pledge_status", "degraded_flags",
+                "shares_basis", "ev_ebitda", "fcf_yield", "cash_adj_pe",
+                "goodwill_ratio", "floor_baseline", "floor_premium",
+                "composite_score", "composite_factors"]
         show = [c for c in cols if c in df.columns]
         html = df[show].to_html(index=False, border=0, classes="screener",
                                 float_format=lambda x: f"{x:.2f}")
+        r_included = bool(df["composite_r_included"].iloc[0]) if (
+            "composite_r_included" in df.columns and len(df)) else False
+        scoring_note = (
+            "综合分 = 五因子（ROE/FCF收益率/EV-EBITDA逆/底价溢价逆/已核实穿透回报率R），权重和为1"
+            if r_included else
+            "综合分 = 四因子（ROE/FCF收益率/EV-EBITDA逆/底价溢价逆），R未核实不参与、剩余权重重归一化；"
+            "R_proxy 仅为代理诊断（合并OCF−Capex），不进入综合分")
+        pe_note = "PE 口径见 pe_basis：优先 TTM，源缺失时回退静态（最新年报EPS）；pe_static 为明细列"
         page = f"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
 <title>龟龟选股器 · AKShare 版</title>
@@ -890,7 +1185,9 @@ table.screener th:first-child,table.screener td:first-child{{text-align:left}}
 table.screener th{{background:#1a1a2e;color:#fff;position:sticky;top:0}}
 </style></head><body>
 <h1>龟龟选股器 · AKShare 版</h1>
-<p>生成时间 {datetime.now().strftime('%Y-%m-%d %H:%M')} · {len(df)} 只 · PE 为静态口径(最新年报EPS)</p>
+<p>生成时间 {datetime.now().strftime('%Y-%m-%d %H:%M')} · {len(df)} 只</p>
+<p>{scoring_note}</p>
+<p>{pe_note}；degraded_flags 非空表示质押/审计等未核实，仅候选、不等于通过。</p>
 {html}
 </body></html>"""
         with open(path, "w", encoding="utf-8") as f:
@@ -902,7 +1199,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="guigui_invest screener (AKShare)")
     parser.add_argument("--tier1-only", action="store_true")
     parser.add_argument("--tier2-limit", type=int, default=None,
-                        help="Cap stocks entering Tier 2 (e.g. 30)")
+                        help="Cap stocks entering Tier 2 (e.g. 30); observation "
+                             "channel keeps its reserved quota, main fills the rest")
     parser.add_argument("--csv", default=None)
     parser.add_argument("--html", default=None)
     parser.add_argument("--min-roe", type=float, default=None)
@@ -910,6 +1208,9 @@ def main() -> int:
     parser.add_argument("--min-gross-margin", type=float, default=None)
     parser.add_argument("--cache-refresh", action="store_true")
     args = parser.parse_args()
+
+    if args.tier2_limit is not None and args.tier2_limit < 1:
+        parser.error("--tier2-limit must be >= 1")
 
     cfg = ScreenerConfig()
     if args.min_roe is not None:
@@ -919,7 +1220,11 @@ def main() -> int:
     if args.min_gross_margin is not None:
         cfg.min_gross_margin = args.min_gross_margin
 
-    screener = AKShareScreener(cfg)
+    try:
+        screener = AKShareScreener(cfg)
+    except ValueError as exc:
+        print(f"❌ 配置非法: {exc}")
+        return 1
     if args.cache_refresh:
         screener.cache.clear()
         screener.client._cache.clear()
