@@ -1,3 +1,11 @@
+---
+id: analysis-contract
+type: architecture-design
+title: 数据与交付约束（全仓优先契约）
+status: draft
+parent: guigui-goal
+---
+
 # 数据与交付约束（优先于历史提示词中的冲突说明）
 
 所有 command、coordinator、分析/审计角色先读本文件。§1–§17 段号与原有参数名保持兼容；无法验证的字段用 `null/未核实`，不得为满足模板而编造。
