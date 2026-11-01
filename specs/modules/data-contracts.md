@@ -1,3 +1,13 @@
+---
+id: data-contracts
+type: module-design
+title: 内部数据契约层
+status: draft
+parent: guigui-architecture
+references:
+  - analysis-contract
+---
+
 # 内部数据契约层
 
 **代码**：`scripts/financial_contracts.py`、`scripts/data_snapshot.py`、`scripts/financial_supplement.py`、`scripts/akshare_modules/constants.py`

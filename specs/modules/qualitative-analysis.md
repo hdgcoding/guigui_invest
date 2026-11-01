@@ -1,3 +1,17 @@
+---
+id: qualitative-analysis
+type: module-design
+title: 商业定性分析（D1–D6，/business-analysis）
+status: draft
+parent: guigui-architecture
+depends-on:
+  - data-collection
+  - pdf-pipeline
+  - report-quality
+references:
+  - analysis-contract
+---
+
 # 商业定性分析（D1–D6，/business-analysis）
 
 **提示词资产**：`shared/qualitative/`（coordinator / qualitative_assessment / data_collection + `agents/`（numeric_audit / cleanroom_audit / writing_style）+ `references/`（output_schema / 判断锚点 / 行业指标 / 写作规则）+ `templates/`）；入口 `.opencode/command/business-analysis.md`

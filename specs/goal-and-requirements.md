@@ -1,3 +1,10 @@
+---
+id: guigui-goal
+type: goal-and-requirements
+title: 龟龟投资框架 — 目标与需求
+status: draft
+---
+
 # 龟龟投资框架 — 目标与需求
 
 ## 目标

@@ -1,3 +1,18 @@
+---
+id: turtle-strategy
+type: module-design
+title: 龟龟策略编排（/turtle-analysis）
+status: draft
+parent: guigui-architecture
+depends-on:
+  - qualitative-analysis
+  - data-collection
+  - valuation-engine
+  - report-quality
+references:
+  - analysis-contract
+---
+
 # 龟龟策略编排（/turtle-analysis）
 
 **提示词资产**：`strategies/turtle/`（coordinator / phase2_PDF解析 / phase3_quantitative / phase3_valuation + `references/`（factor_interface / shared_tables / judgment_examples））；入口 `.opencode/command/turtle-analysis.md` + `.opencode/skills/turtle-analysis/`

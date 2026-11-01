@@ -81,14 +81,14 @@ output/{code}_{company}/  报告 .md + .html
 
 | 段号 | 内容 | 来源（AKShare） |
 |------|------|----------------|
-| §1 | 基本信息（价格/市值/PE/PB/上市日期） | stock_zh_a_hist + stock_zh_valuation_baidu + stock_info_* |
-| §2 | 行情数据（52 周范围） | stock_zh_a_hist(weekly) |
+| §1 | 基本信息（价格/市值/PE/PB/上市日期） | stock_zh_a_daily + stock_zh_valuation_baidu + stock_info_* |
+| §2 | 行情数据（52 周范围） | stock_zh_a_daily（日线重采样周线） |
 | §3/§3P | 合并/母公司利润表（5 年） | stock_financial_report_sina（母公司表缺失时降级标注） |
 | §4/§4P | 合并/母公司资产负债表（5 年） | 同上 |
 | §5 | 合并现金流量表 + FCF | 同上（FCF 计算） |
-| §6 | 分红历史 | stock_history_dividend_detail |
+| §6 | 分红历史 | stock_fhps_detail_em（东财，按报告期） |
 | §7–§10 | 治理/行业/竞争/子公司占位 | Agent WebSearch 补充 |
-| §11 | 周线数据（10 年摘要） | stock_zh_a_hist(weekly, 10y) |
+| §11 | 周线数据（10 年摘要） | stock_zh_a_daily（日线重采样周线，10y） |
 | §12 | 财务指标（ROE/毛利率等） | stock_financial_analysis_indicator |
 | §13 | 风险警告 | 自动检测 + Agent 补充 |
 | §14 | 无风险利率（10 年国债） | bond_zh_us_rate |

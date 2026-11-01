@@ -1,3 +1,13 @@
+---
+id: screener
+type: module-design
+title: 两级选股器
+status: draft
+parent: guigui-architecture
+depends-on:
+  - data-collection
+---
+
 # 两级选股器
 
 **代码**：`scripts/screener_core.py`、`scripts/screener_config.py`

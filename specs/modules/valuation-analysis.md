@@ -1,3 +1,18 @@
+---
+id: valuation-analysis
+type: module-design
+title: 独立估值编排（/valuation）
+status: draft
+parent: guigui-architecture
+depends-on:
+  - qualitative-analysis
+  - data-collection
+  - valuation-engine
+  - report-quality
+references:
+  - analysis-contract
+---
+
 # 独立估值编排（/valuation）
 
 **提示词资产**：`strategies/valuation/`（coordinator / phase2_valuation + `references/`（classification_rules / valuation_methods / valuation_examples / report_template））；入口 `.opencode/command/valuation.md`

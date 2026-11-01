@@ -1,3 +1,15 @@
+---
+id: report-quality
+type: module-design
+title: 报告质量门禁（确定性核验杠杆）
+status: draft
+parent: guigui-architecture
+depends-on:
+  - data-contracts
+references:
+  - analysis-contract
+---
+
 # 报告质量门禁（确定性核验杠杆）
 
 **代码**：`scripts/quality_control.py`（杠杆 1）、`scripts/report_consistency.py`（杠杆 6）

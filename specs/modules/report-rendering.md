@@ -1,3 +1,11 @@
+---
+id: report-rendering
+type: module-design
+title: MD→HTML 仪表盘渲染
+status: draft
+parent: guigui-architecture
+---
+
 # MD→HTML 仪表盘渲染
 
 **代码**：`scripts/report_to_html.py`

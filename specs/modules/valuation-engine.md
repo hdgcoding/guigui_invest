@@ -1,3 +1,15 @@
+---
+id: valuation-engine
+type: module-design
+title: 估值引擎（确定性估值计算）
+status: draft
+parent: guigui-architecture
+depends-on:
+  - data-contracts
+references:
+  - analysis-contract
+---
+
 # 估值引擎（确定性估值计算）
 
 **代码**：`scripts/valuation_engine.py`

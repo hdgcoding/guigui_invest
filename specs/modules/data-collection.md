@@ -1,3 +1,15 @@
+---
+id: data-collection
+type: module-design
+title: 数据采集（§1–§17 数据包生产者）
+status: draft
+parent: guigui-architecture
+depends-on:
+  - data-contracts
+references:
+  - analysis-contract
+---
+
 # 数据采集（§1–§17 数据包生产者）
 
 **代码**：`scripts/akshare_collector.py`（AKShareClient 门面 + CLI）、`scripts/akshare_modules/`（Infrastructure / Financials / OtherData / DerivedMetrics / Assembly 五个 mixin——内部实现分层，非独立边界）

@@ -1,3 +1,11 @@
+---
+id: pdf-pipeline
+type: module-design
+title: 年报 PDF 下载与文本提取
+status: draft
+parent: guigui-architecture
+---
+
 # 年报 PDF 下载与文本提取
 
 **代码**：`scripts/download_report.py`、`scripts/pdf_preprocessor.py`

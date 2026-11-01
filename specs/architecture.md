@@ -1,3 +1,13 @@
+---
+id: guigui-architecture
+type: architecture-design
+title: 混合架构 — Python 确定性层 × LLM 定性层
+status: draft
+parent: guigui-goal
+references:
+  - analysis-contract
+---
+
 # 混合架构 — Python 确定性层 × LLM 定性层
 
 ## 拓扑：四阶段流水线
