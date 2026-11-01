@@ -2,10 +2,9 @@
 id: data-contracts
 type: module-design
 title: 内部数据契约层
-status: draft
+status: active
 parent: guigui-architecture
-references:
-  - analysis-contract
+references: [analysis-contract]
 ---
 
 # 内部数据契约层

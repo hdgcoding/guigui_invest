@@ -2,12 +2,10 @@
 id: valuation-engine
 type: module-design
 title: 估值引擎（确定性估值计算）
-status: draft
+status: active
 parent: guigui-architecture
-depends-on:
-  - data-contracts
-references:
-  - analysis-contract
+depends-on: [data-contracts]
+references: [analysis-contract]
 ---
 
 # 估值引擎（确定性估值计算）

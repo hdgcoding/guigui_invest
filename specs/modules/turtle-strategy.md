@@ -2,15 +2,10 @@
 id: turtle-strategy
 type: module-design
 title: 龟龟策略编排（/turtle-analysis）
-status: draft
+status: active
 parent: guigui-architecture
-depends-on:
-  - qualitative-analysis
-  - data-collection
-  - valuation-engine
-  - report-quality
-references:
-  - analysis-contract
+depends-on: [qualitative-analysis, data-collection, valuation-engine, report-quality]
+references: [analysis-contract]
 ---
 
 # 龟龟策略编排（/turtle-analysis）

@@ -2,12 +2,10 @@
 id: data-collection
 type: module-design
 title: 数据采集（§1–§17 数据包生产者）
-status: draft
+status: active
 parent: guigui-architecture
-depends-on:
-  - data-contracts
-references:
-  - analysis-contract
+depends-on: [data-contracts]
+references: [analysis-contract]
 ---
 
 # 数据采集（§1–§17 数据包生产者）

@@ -2,7 +2,7 @@
 id: report-rendering
 type: module-design
 title: MD→HTML 仪表盘渲染
-status: draft
+status: active
 parent: guigui-architecture
 ---
 

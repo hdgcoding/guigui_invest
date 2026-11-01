@@ -2,7 +2,7 @@
 id: pdf-pipeline
 type: module-design
 title: 年报 PDF 下载与文本提取
-status: draft
+status: active
 parent: guigui-architecture
 ---
 

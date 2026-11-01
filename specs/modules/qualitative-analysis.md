@@ -2,14 +2,10 @@
 id: qualitative-analysis
 type: module-design
 title: 商业定性分析（D1–D6，/business-analysis）
-status: draft
+status: active
 parent: guigui-architecture
-depends-on:
-  - data-collection
-  - pdf-pipeline
-  - report-quality
-references:
-  - analysis-contract
+depends-on: [data-collection, pdf-pipeline, report-quality]
+references: [analysis-contract]
 ---
 
 # 商业定性分析（D1–D6，/business-analysis）

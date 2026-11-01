@@ -2,15 +2,10 @@
 id: valuation-analysis
 type: module-design
 title: 独立估值编排（/valuation）
-status: draft
+status: active
 parent: guigui-architecture
-depends-on:
-  - qualitative-analysis
-  - data-collection
-  - valuation-engine
-  - report-quality
-references:
-  - analysis-contract
+depends-on: [qualitative-analysis, data-collection, valuation-engine, report-quality]
+references: [analysis-contract]
 ---
 
 # 独立估值编排（/valuation）

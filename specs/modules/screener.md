@@ -2,10 +2,9 @@
 id: screener
 type: module-design
 title: 两级选股器
-status: draft
+status: active
 parent: guigui-architecture
-depends-on:
-  - data-collection
+depends-on: [data-collection]
 ---
 
 # 两级选股器

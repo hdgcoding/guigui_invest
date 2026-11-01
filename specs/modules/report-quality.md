@@ -2,12 +2,10 @@
 id: report-quality
 type: module-design
 title: 报告质量门禁（确定性核验杠杆）
-status: draft
+status: active
 parent: guigui-architecture
-depends-on:
-  - data-contracts
-references:
-  - analysis-contract
+depends-on: [data-contracts]
+references: [analysis-contract]
 ---
 
 # 报告质量门禁（确定性核验杠杆）

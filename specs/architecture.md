@@ -2,10 +2,9 @@
 id: guigui-architecture
 type: architecture-design
 title: 混合架构 — Python 确定性层 × LLM 定性层
-status: draft
+status: active
 parent: guigui-goal
-references:
-  - analysis-contract
+references: [analysis-contract]
 ---
 
 # 混合架构 — Python 确定性层 × LLM 定性层

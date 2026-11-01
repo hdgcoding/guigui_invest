@@ -2,7 +2,7 @@
 id: analysis-contract
 type: architecture-design
 title: 数据与交付约束（全仓优先契约）
-status: draft
+status: active
 parent: guigui-goal
 ---
 

@@ -2,7 +2,7 @@
 id: guigui-goal
 type: goal-and-requirements
 title: 龟龟投资框架 — 目标与需求
-status: draft
+status: active
 ---
 
 # 龟龟投资框架 — 目标与需求
@@ -20,7 +20,7 @@ AI 辅助的 A 股基本面分析系统：**Python 完成确定性数据采集�
 
 ## 受众
 
-通过 OpenCode slash 命令（`/business-analysis` 等）运行分析的个人投资者/分析者。*（推断，待确认）*
+通过 OpenCode slash 命令（`/business-analysis` 等）运行分析的个人投资者/分析者。
 
 ## 能力（代码现有）
 
