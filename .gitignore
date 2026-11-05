@@ -18,3 +18,6 @@ __pycache__/
 !.opencode/skills/
 !.opencode/skills/turtle-analysis/
 !.opencode/skills/turtle-analysis/SKILL.md
+
+# 来源核对证据（归母现金/母公司/审计）允许入库
+!output/**/financial_supplement.json

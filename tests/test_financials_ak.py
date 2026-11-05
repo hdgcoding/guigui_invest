@@ -274,3 +274,62 @@ class TestValuationDateAlignment:
         assert info["pe_ttm"] == pytest.approx(19.38)
         assert info["total_share"] == pytest.approx(112_763_400.0 / 51.99, rel=1e-6)
         assert "总市值 (万元)" in md
+
+
+class TestActualShares:
+    def test_eastmoney_latest_price_match_is_verified(self, client, monkeypatch):
+        em = pd.DataFrame({"item": ["最新", "总股本"], "value": [38.70, 5_601_405_741]})
+        calls = []
+
+        def fake_fetch(fetch, retries=1):
+            calls.append(1)
+            return em if len(calls) == 1 else pd.DataFrame()
+
+        monkeypatch.setattr(client, "_fetch_with_retry", fake_fetch)
+        out = client._fetch_actual_shares("000651", 38.70, "20261105")
+        assert out is not None
+        assert out["total_share_wan"] == pytest.approx(560_140.5741)
+        assert out["source"] == "eastmoney_individual_info"
+        assert len(calls) == 1  # no cninfo fallback needed
+
+    def test_eastmoney_price_mismatch_falls_back_to_stale_cninfo_and_rejects(self, client, monkeypatch):
+        em = pd.DataFrame({"item": ["最新", "总股本"], "value": [38.90, 5_601_405_741]})
+        cn = pd.DataFrame({"变动日期": ["2026-06-30"], "总股本": [560_140.5741]})
+        calls = []
+
+        def fake_fetch(fetch, retries=1):
+            calls.append(1)
+            return em if len(calls) == 1 else cn
+
+        monkeypatch.setattr(client, "_fetch_with_retry", fake_fetch)
+        assert client._fetch_actual_shares("000651", 38.70, "20261105") is None
+        assert len(calls) == 2
+
+    def test_recent_cninfo_change_is_accepted(self, client, monkeypatch):
+        em = pd.DataFrame()
+        cn = pd.DataFrame({"变动日期": ["2026-11-03"], "总股本": [560_140.5741]})
+        calls = []
+
+        def fake_fetch(fetch, retries=1):
+            calls.append(1)
+            return em if len(calls) == 1 else cn
+
+        monkeypatch.setattr(client, "_fetch_with_retry", fake_fetch)
+        out = client._fetch_actual_shares("000651", 38.70, "20261105")
+        assert out is not None
+        assert out["source"] == "cninfo_share_change"
+        assert out["total_share_wan"] == pytest.approx(560_140.5741)
+
+    def test_basic_info_uses_verified_shares_over_market_cap_inference(self, client, monkeypatch):
+        monkeypatch.setattr(client, "_fetch_name_and_list_date", lambda ts_code: ("格力电器", "1996-11-18"))
+        monkeypatch.setattr(client, "_fetch_latest_daily", lambda num: {"close": 38.70, "date": "20261105"})
+        monkeypatch.setattr(client, "_fetch_valuation", lambda num, price_date=None: {
+            "date": "20261105", "pe_ttm": 7.5, "pb": 1.45, "total_mv_wan": 21_823_100.0})
+        monkeypatch.setattr(client, "_fetch_actual_shares", lambda num, close, quote_date: {
+            "total_share_wan": 560_140.5741, "basis": "test actual shares",
+            "change_date": "20261105", "source": "test"})
+        client.get_basic_info("000651.SZ")
+        row = client._store["basic_info"].iloc[0]
+        assert bool(row["shares_verified"]) is True
+        assert row["total_share"] == pytest.approx(560_140.5741)
+        assert row["total_mv"] == pytest.approx(560_140.5741 * 38.70)

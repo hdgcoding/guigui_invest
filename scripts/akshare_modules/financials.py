@@ -158,11 +158,26 @@ class FinancialsMixin:
         total_mv_wan = val.get("total_mv_wan")   # 万元
 
         total_share_wan = None
+        shares_verified = False
+        shares_basis = "未核实"
+        share_change_date = None
         synchronized = val.get("date") == price_df.get("date") and val.get("date") is not None
         if not synchronized:
             pe_ttm, pb = None, None
-        if total_mv_wan and close and synchronized:
+
+        # Prefer a real share count over the market-cap/price inference. The
+        # inference is only a fallback because it silently turns a valuation
+        # date mismatch into a fake share count.
+        actual_shares = self._fetch_actual_shares(num, close, price_df.get("date"))
+        if actual_shares:
+            total_share_wan = actual_shares["total_share_wan"]
+            shares_verified = True
+            shares_basis = actual_shares["basis"]
+            share_change_date = actual_shares.get("change_date")
+            total_mv_wan = total_share_wan * close if close else None  # 万元
+        elif total_mv_wan and close and synchronized:
             total_share_wan = total_mv_wan * 1e4 / close / 1e4  # 万股
+            shares_basis = "同日市值/未复权价格推算，非实测总股本"
         elif total_mv_wan:
             total_mv_wan = None
 
@@ -177,7 +192,9 @@ class FinancialsMixin:
             "total_mv": total_mv_wan,          # 万元 (Tushare convention)
             "circ_mv": None,  # total market cap is not circulating market cap
             "total_share": total_share_wan,    # 万股
-            "shares_basis": "同日市值/未复权价格推算，非实测总股本" if total_share_wan else "未核实",
+            "shares_verified": shares_verified,
+            "shares_basis": shares_basis,
+            "share_change_date": share_change_date,
             "valuation_date": val.get("date"),
             "price_basis": "unadjusted",
             "list_date": list_date,
@@ -195,12 +212,77 @@ class FinancialsMixin:
             ["总市值 (万元)", format_number(total_mv_wan, divider=1)],
             ["总股本 (万股)", format_number(total_share_wan, divider=1)],
             ["行情日期 / 估值日期", f"{price_df.get('date', '—')} / {val.get('date', '—')}"],
-            ["股本口径", "同日市值÷未复权收盘价（推算）" if total_share_wan else "未核实；禁止计算每股估值"],
+            ["股本口径", shares_basis if total_share_wan else "未核实；禁止计算每股估值"],
         ]
         lines.append(format_table(["项目", "内容"], rows, alignments=["l", "r"]))
         lines.append("")
-        lines.append("*来源: AKShare 新浪未复权收盘价/百度估值；PE 为TTM，PB为账面口径；日期不同则市值/股本停用。*")
+        lines.append("*来源: AKShare 新浪未复权收盘价/百度估值；股本优先取东方财富个股信息（最新价与行情日一致）或巨潮股本变动（变动日≤7天），失败才用市值÷股价推算；PE 为TTM，PB为账面口径；日期不同则 PE/PB 停用。*")
         return "\n".join(lines)
+
+    def _fetch_actual_shares(self, num: str, close: float | None,
+                             quote_date: str | None) -> dict | None:
+        """Fetch a real total-share count for the quote date.
+
+        Primary source is Eastmoney's individual stock info, but only when its
+        latest price equals the quote close — that proves the row belongs to
+        the same trading day. Fallback is cninfo's share-change table, accepted
+        only when the latest change date is within 7 days of the quote date
+        (older rows may not reflect option exercises / buyback cancellations).
+        Returns ``None`` rather than a stale count.
+        """
+        if not close or not quote_date:
+            return None
+
+        def _fetch_em():
+            import akshare as ak
+            return ak.stock_individual_info_em(symbol=num)
+
+        em = self._fetch_with_retry(_fetch_em, retries=1)
+        if em is not None and not em.empty and {"item", "value"}.issubset(em.columns):
+            info = {str(k): v for k, v in zip(em["item"], em["value"])}
+            latest = self._safe_float(info.get("最新"))
+            total = self._safe_float(info.get("总股本"))
+            if latest is not None and total is not None and total > 0:
+                if abs(latest - close) <= max(0.01, abs(close) * 1e-6):
+                    return {
+                        "total_share_wan": total / 1e4,
+                        "basis": (f"东方财富个股信息（最新价 {latest:.2f} 与行情日一致；"
+                                  f"总股本 {total:,.0f} 股）"),
+                        "change_date": quote_date,
+                        "source": "eastmoney_individual_info",
+                    }
+
+        def _fetch_cninfo():
+            import akshare as ak
+            start = f"{max(2000, int(quote_date[:4]) - 3)}0101"
+            return ak.stock_share_change_cninfo(symbol=num, start_date=start, end_date=quote_date)
+
+        cn = self._fetch_with_retry(_fetch_cninfo, retries=1)
+        if cn is None or cn.empty or "总股本" not in cn.columns or "变动日期" not in cn.columns:
+            return None
+        working = cn.copy()
+        working["_change_date"] = pd.to_datetime(working["变动日期"], errors="coerce")
+        cutoff = pd.to_datetime(quote_date, format="%Y%m%d", errors="coerce")
+        if pd.isna(cutoff):
+            return None
+        working = working[working["_change_date"].notna() & (working["_change_date"] <= cutoff)]
+        if working.empty:
+            return None
+        row = working.sort_values("_change_date").iloc[-1]
+        total = self._safe_float(row.get("总股本"))
+        change_date = row["_change_date"]
+        if total is None or total <= 0:
+            return None
+        # A stale share-change row is not proof of today's count.
+        if (cutoff - change_date).days > 7:
+            return None
+        return {
+            "total_share_wan": total,
+            "basis": (f"巨潮资讯公司股本变动（变动日期 {change_date.strftime('%Y-%m-%d')}；"
+                      f"总股本 {total:,.4f} 万股）"),
+            "change_date": change_date.strftime("%Y%m%d"),
+            "source": "cninfo_share_change",
+        }
 
     def _fetch_name_and_list_date(self, ts_code: str) -> tuple[str | None, str | None]:
         """Resolve stock name + listing date via exchange tables."""
