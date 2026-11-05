@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "ts_code": "601857.SH",
+  "amount_unit": "yuan",
+  "statement_reconciliations": [],
+  "owner_cashflow": [
+    {
+      "end_date": "20251231",
+      "scope": "parent_attributable",
+      "source": "output/601857_中国石油/601857_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并及公司现金流量表（P.105-106）：OCF 412,510、Capex 292,789、分配项 111,199、子公司支付少数股东股利 10,795（百万元）；2025年内实际支付普通股股利 86,019.86（2024末期 45,755.24 + 2025中期 40,264.62），倒算利息 14,384.14；无重大受限资产；2025年非经常性损益为净损失 4,369，按0不扣减。",
+      "ocf_yuan": 412510000000.0,
+      "capex_yuan": 292789000000.0,
+      "interest_paid_yuan": 14384140000.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 10795000000.0,
+      "restricted_cash_increase_yuan": 0.0,
+      "nonrecurring_net_inflow_yuan": 0.0
+    },
+    {
+      "end_date": "20241231",
+      "scope": "parent_attributable",
+      "source": "output/601857_中国石油/601857_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表2024比较列：OCF 406,532、Capex 302,651、分配项 106,259、少数股东股利 11,139（百万元）；2024年内实际支付普通股股利 82,359.44（2023末期 42,094.82 + 2024中期 40,264.62），倒算利息 12,760.56；无重大受限资产；2024年非经常性损益为净损失 8,611，按0不扣减。",
+      "ocf_yuan": 406532000000.0,
+      "capex_yuan": 302651000000.0,
+      "interest_paid_yuan": 12760560000.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 11139000000.0,
+      "restricted_cash_increase_yuan": 0.0,
+      "nonrecurring_net_inflow_yuan": 0.0
+    }
+  ],
+  "audit": {
+    "end_date": "20251231",
+    "source": "output/601857_中国石油/601857_2025_年报.pdf",
+    "locator": "P.2 重要提示；毕马威会计师事务所审计报告",
+    "review_status": "source_reconciled",
+    "reconciliation_note": "毕马威会计师事务所出具无保留意见审计报告。",
+    "opinion": "标准无保留意见"
+  }
+}

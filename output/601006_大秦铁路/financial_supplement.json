@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "ts_code": "601006.SH",
+  "amount_unit": "yuan",
+  "statement_reconciliations": [
+    {
+      "end_date": "20211231",
+      "scope": "consolidated",
+      "same_reporting_basis": true,
+      "source": "output/601006_大秦铁路/601006_2025_年报.pdf 及对应年度报告",
+      "locator": "20211231 三表比较列",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "利润表取自2022年报比较列（2023-04-27），资产负债表/现金流量表取自2021年报（2022-04-27）；同一报告期、同一合并范围，差异为数据源保留版本不同，不构成追溯重述。2021年不进入AA（AA取2025/2024）。"
+    }
+  ],
+  "owner_cashflow": [
+    {
+      "end_date": "20251231",
+      "scope": "parent_attributable",
+      "source": "output/601006_大秦铁路/601006_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表（P.149）：OCF 4,986,743,179、Capex 27,181,359,442、分配项 5,419,120,547、少数股东股利 693,816,716；母公司现金流量表分配项 4,432,379,098（母公司财务费用为净收益，无利息支出），倒算利息 292,924,733；受限货币资金 16,001,672（2025年末）−0（2024年末）=16,001,672；非经常性损益合计 39,222,858（P.8）。",
+      "ocf_yuan": 4986743179.0,
+      "capex_yuan": 27181359442.0,
+      "interest_paid_yuan": 292924733.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 693816716.0,
+      "restricted_cash_increase_yuan": 16001672.0,
+      "nonrecurring_net_inflow_yuan": 39222858.0
+    },
+    {
+      "end_date": "20241231",
+      "scope": "parent_attributable",
+      "source": "output/601006_大秦铁路/601006_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表2024比较列：OCF 9,316,632,097、Capex 4,532,156,822、分配项 10,552,093,927、少数股东股利 722,235,866；母公司分配项 9,472,538,763，倒算利息 357,319,276；受限货币资金 2024年末为0；非经常性损益合计 3,464,618。（2024年报来源：https://stockn.xueqiu.com/SH601006/20250429672347.pdf）",
+      "ocf_yuan": 9316632097.0,
+      "capex_yuan": 4532156822.0,
+      "interest_paid_yuan": 357319276.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 722235866.0,
+      "restricted_cash_increase_yuan": 0.0,
+      "nonrecurring_net_inflow_yuan": 3464618.0
+    }
+  ],
+  "audit": {
+    "end_date": "20251231",
+    "source": "output/601006_大秦铁路/601006_2025_年报.pdf",
+    "locator": "P.2 重要提示；信永中和会计师事务所审计报告",
+    "review_status": "source_reconciled",
+    "reconciliation_note": "信永中和会计师事务所（特殊普通合伙）出具标准无保留意见审计报告。",
+    "opinion": "标准无保留意见"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "ts_code": "601088.SH",
+  "amount_unit": "yuan",
+  "statement_reconciliations": [],
+  "owner_cashflow": [
+    {
+      "end_date": "20251231",
+      "scope": "parent_attributable",
+      "source": "output/601088_中国神华/601088_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表（P.161-162）：OCF 75,059、Capex 48,398、分配股利/利润/利息 87,204、子公司支付少数股东股利 20,588；母公司现金流量表（P.163）分配项 64,810、母公司财务费用为净收益（无利息支出）；受限资金 17,637（2025年末）−14,189（2024年末）=3,448；非经常性损益合计 4,260（P.11，百万元）。",
+      "ocf_yuan": 75059000000.0,
+      "capex_yuan": 48398000000.0,
+      "interest_paid_yuan": 1806000000.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 20588000000.0,
+      "restricted_cash_increase_yuan": 3448000000.0,
+      "nonrecurring_net_inflow_yuan": 4260000000.0
+    },
+    {
+      "end_date": "20241231",
+      "scope": "parent_attributable",
+      "source": "output/601088_中国神华/601088_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表2024比较列：OCF 91,086、Capex 37,708、分配项 53,980、少数股东股利 6,809；母公司分配项 45,136（无利息支出）；受限资金 14,189（2024年末）−7,298（2023年末，2024年报）=6,891；2024年非经常性损益为净损失 4,320，不属于现金流入，按0不扣减（也不把非现金损失加回）。（2024年报来源：https://static.cninfo.com.cn/finalpage/2025-03-22/1222870380.PDF）",
+      "ocf_yuan": 91086000000.0,
+      "capex_yuan": 37708000000.0,
+      "interest_paid_yuan": 2035000000.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 6809000000.0,
+      "restricted_cash_increase_yuan": 6891000000.0,
+      "nonrecurring_net_inflow_yuan": 0.0
+    }
+  ],
+  "audit": {
+    "end_date": "20251231",
+    "source": "output/601088_中国神华/601088_2025_年报.pdf",
+    "locator": "P.11 重要提示；毕马威华振会计师事务所审计报告",
+    "review_status": "source_reconciled",
+    "reconciliation_note": "毕马威华振会计师事务所出具标准无保留意见审计报告。",
+    "opinion": "标准无保留意见"
+  }
+}

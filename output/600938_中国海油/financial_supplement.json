@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "ts_code": "600938.SH",
+  "amount_unit": "yuan",
+  "statement_reconciliations": [],
+  "owner_cashflow": [
+    {
+      "end_date": "20251231",
+      "scope": "parent_attributable",
+      "source": "output/600938_中国海油/600938_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表（P.127）：OCF 209,042、Capex 111,555、分配股利/利润 60,432、偿付利息 3,134、子公司支付少数股东股利 75（60,432−母公司 60,357）；无受限现金；非经常性损益合计 1,703（P.97）。",
+      "ocf_yuan": 209042000000.0,
+      "capex_yuan": 111555000000.0,
+      "interest_paid_yuan": 3134000000.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 75000000.0,
+      "restricted_cash_increase_yuan": 0.0,
+      "nonrecurring_net_inflow_yuan": 1703000000.0
+    },
+    {
+      "end_date": "20241231",
+      "scope": "parent_attributable",
+      "source": "output/600938_中国海油/600938_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表2024比较列：OCF 220,891、Capex 123,359、分配股利/利润 60,869、偿付利息 4,193、少数股东股利 134（60,869−母公司 60,735）；无受限现金；非经常性损益合计 4,539。",
+      "ocf_yuan": 220891000000.0,
+      "capex_yuan": 123359000000.0,
+      "interest_paid_yuan": 4193000000.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 134000000.0,
+      "restricted_cash_increase_yuan": 0.0,
+      "nonrecurring_net_inflow_yuan": 4539000000.0
+    }
+  ],
+  "audit": {
+    "end_date": "20251231",
+    "source": "output/600938_中国海油/600938_2025_年报.pdf",
+    "locator": "审计报告（P.126起）；毕马威华振会计师事务所",
+    "review_status": "source_reconciled",
+    "reconciliation_note": "毕马威华振会计师事务所出具标准无保留意见审计报告。",
+    "opinion": "标准无保留意见"
+  }
+}

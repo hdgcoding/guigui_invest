@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "ts_code": "600900.SH",
+  "amount_unit": "yuan",
+  "statement_reconciliations": [
+    {
+      "end_date": "20211231",
+      "scope": "consolidated",
+      "same_reporting_basis": true,
+      "source": "output/600900_长江电力/600900_2025_年报.pdf 及对应年度报告",
+      "locator": "20211231 三表比较列",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "利润表取自2022年报比较列（2023-04-27），资产负债表/现金流量表取自2021年报（2022-04-29）；同一报告期、同一合并范围，差异为数据源保留版本不同，不构成追溯重述。2021年不进入AA（AA取2025/2024）。"
+    }
+  ],
+  "owner_cashflow": [
+    {
+      "end_date": "20251231",
+      "scope": "parent_attributable",
+      "source": "output/600900_长江电力/600900_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表（P.88）：OCF 60,562.93、Capex 18,488.47、分配项 34,191.12、少数股东股利 649.47；母公司现金流量表（P.89）分配项 27,230.79、利息费用 4,200.40，倒算母公司股利 23,030.40；受限货币资金 50,991,682.04（2025年末）−47,177,434.71（2024年末）=3,814,247.33；非经常性损益合计 1,057.23（P.9）。",
+      "ocf_yuan": 60562925570.41,
+      "capex_yuan": 18488466859.29,
+      "interest_paid_yuan": 10511255738.95,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 649469714.09,
+      "restricted_cash_increase_yuan": 3814247.33,
+      "nonrecurring_net_inflow_yuan": 1057233876.45
+    },
+    {
+      "end_date": "20241231",
+      "scope": "parent_attributable",
+      "source": "output/600900_长江电力/600900_2025_年报.pdf",
+      "locator": "合并现金流量表、母公司现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表2024比较列：OCF 59,648.47、Capex 14,634.08、分配项 31,633.48、少数股东股利 125.46；母公司分配项 25,206.23、利息费用 5,033.04；受限货币资金 2024年末 47,177,434.71，较2023年末变动未单列且金额不重大，按0不调整；2024年非经常性损益为净损失 0.11亿元，按0不扣减。（2024年报来源：https://static.cninfo.com.cn/finalpage/2025-04-30/1223421172.PDF）",
+      "ocf_yuan": 59648468284.22,
+      "capex_yuan": 14634075051.41,
+      "interest_paid_yuan": 11334835103.02,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 125455490.82,
+      "restricted_cash_increase_yuan": 0.0,
+      "nonrecurring_net_inflow_yuan": 0.0
+    }
+  ],
+  "audit": {
+    "end_date": "20251231",
+    "source": "output/600900_长江电力/600900_2025_年报.pdf",
+    "locator": "P.2 重要提示；信永中和会计师事务所审计报告",
+    "review_status": "source_reconciled",
+    "reconciliation_note": "信永中和会计师事务所（特殊普通合伙）出具标准无保留意见审计报告。",
+    "opinion": "标准无保留意见"
+  }
+}

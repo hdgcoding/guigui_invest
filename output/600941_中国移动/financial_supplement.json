@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "ts_code": "600941.SH",
+  "amount_unit": "yuan",
+  "statement_reconciliations": [
+    {
+      "end_date": "20231231",
+      "scope": "consolidated",
+      "same_reporting_basis": true,
+      "source": "output/600941_中国移动/600941_2025_年报.pdf 及对应年度报告",
+      "locator": "20231231 三表比较列",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "利润表取自2024年报比较列（2025-03-20），资产负债表/现金流量表取自2023年报（2024-03-21）；同一报告期、同一合并范围，差异为数据源保留版本不同，不构成追溯重述。"
+    },
+    {
+      "end_date": "20221231",
+      "scope": "consolidated",
+      "same_reporting_basis": true,
+      "source": "output/600941_中国移动/600941_2025_年报.pdf 及对应年度报告",
+      "locator": "20221231 三表比较列",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "利润表/现金流量表取自2023年报比较列（2024-03-23），资产负债表取自2022年报（2023-04-20）；同一报告期、同一合并范围，差异为数据源保留版本不同，不构成追溯重述。"
+    }
+  ],
+  "owner_cashflow": [
+    {
+      "end_date": "20251231",
+      "scope": "parent_attributable",
+      "source": "output/600941_中国移动/600941_2025_年报.pdf",
+      "locator": "合并现金流量表（P.90）、受限资产附注（P.76）、非经常性损益表（P.76）",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表（P.90）：OCF 232,919、Capex 156,951、分配股利/利润/利息 104,202（百万元）；2025年内实际支付普通股股利 103,600.28（2024末期 49,512.86 + 2025中期 54,087.42），倒算利息 601.72；少数股东权益不重大、年报未单列子公司支付少数股东股利，按0；受限银行存款 3,005（2025年末）−2,701（2024年末）=304；非经常性损益合计 9,134（P.76）。",
+      "ocf_yuan": 232919000000.0,
+      "capex_yuan": 156951000000.0,
+      "interest_paid_yuan": 601720000.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 0.0,
+      "restricted_cash_increase_yuan": 304000000.0,
+      "nonrecurring_net_inflow_yuan": 9134000000.0
+    },
+    {
+      "end_date": "20241231",
+      "scope": "parent_attributable",
+      "source": "output/600941_中国移动/600941_2025_年报.pdf",
+      "locator": "合并现金流量表、受限资产附注、非经常性损益表",
+      "review_status": "source_reconciled",
+      "reconciliation_note": "合并现金流量表2024比较列：OCF 315,741、Capex 155,979、分配项 97,571（百万元）；2024年内实际支付普通股股利 97,844.21（2023末期 46,817.18 + 2024中期 51,027.03），与分配项差异为汇率/预扣税等，利息按0不重复扣减；受限银行存款 2,701（2024年末）−2,887（2023年末）为净减少，按0；非经常性损益合计 15,658。（2024年报来源：https://static.cninfo.com.cn/finalpage/2025-03-21/1222856315.PDF）",
+      "ocf_yuan": 315741000000.0,
+      "capex_yuan": 155979000000.0,
+      "interest_paid_yuan": 0.0,
+      "interest_classification": "financing",
+      "minority_claim_yuan": 0.0,
+      "restricted_cash_increase_yuan": 0.0,
+      "nonrecurring_net_inflow_yuan": 15658000000.0
+    }
+  ],
+  "audit": {
+    "end_date": "20251231",
+    "source": "output/600941_中国移动/600941_2025_年报.pdf",
+    "locator": "P.2 重要提示；毕马威华振会计师事务所审计报告",
+    "review_status": "source_reconciled",
+    "reconciliation_note": "毕马威华振会计师事务所出具标准无保留意见审计报告。",
+    "opinion": "标准无保留意见"
+  }
+}
